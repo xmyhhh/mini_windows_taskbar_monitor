@@ -34,6 +34,13 @@ struct WidgetPalette {
     COLORREF secondary_text;
 };
 
+struct BgraPixel {
+    BYTE blue;
+    BYTE green;
+    BYTE red;
+    BYTE alpha;
+};
+
 int ScaleByDpi(UINT dpi, int value) {
     return MulDiv(value, static_cast<int>(dpi), 96);
 }
@@ -237,9 +244,6 @@ private:
                                          nullptr,
                                          instance_handle_,
                                          this);
-        if (widget_window_ != nullptr) {
-            SetLayeredWindowAttributes(widget_window_, 0, 255, LWA_ALPHA);
-        }
         return widget_window_ != nullptr;
     }
 
@@ -318,7 +322,7 @@ private:
             return;
         }
         ShowWindow(widget_window_, SW_SHOWNOACTIVATE);
-        InvalidateRect(widget_window_, nullptr, TRUE);
+        RequestWidgetRedraw();
     }
 
     void RefreshFontAndSize() {
@@ -342,7 +346,7 @@ private:
                                 DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS,
                                 CLIP_DEFAULT_PRECIS,
-                                CLEARTYPE_NATURAL_QUALITY,
+                                ANTIALIASED_QUALITY,
                                 DEFAULT_PITCH | FF_DONTCARE,
                                 L"Segoe UI");
         }
@@ -383,40 +387,7 @@ private:
         line2_text_ = lines.line2;
     }
 
-    void SampleAndRefresh() {
-        UpdateDisplayLines(metrics_.Sample());
-        if (widget_window_ != nullptr && IsWindow(widget_window_)) {
-            InvalidateRect(widget_window_, nullptr, TRUE);
-        }
-    }
-
-    void UpdateLayout() {
-        if (!EnsureWidgetWindow()) {
-            return;
-        }
-
-        if (!embedder_.IsAttached()) {
-            ReattachWidget();
-            return;
-        }
-
-        const UINT previous_dpi = current_dpi_;
-        RefreshFontAndSize();
-        if (current_dpi_ != previous_dpi) {
-            InvalidateRect(widget_window_, nullptr, TRUE);
-        }
-        if (!embedder_.RefreshLayout(widget_window_, widget_size_)) {
-            ShowWindow(widget_window_, SW_HIDE);
-            SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
-        }
-    }
-
-    void PaintWidget() {
-        PAINTSTRUCT paint_struct{};
-        HDC dc = BeginPaint(widget_window_, &paint_struct);
-
-        RECT client_rect{};
-        GetClientRect(widget_window_, &client_rect);
+    void DrawWidgetContents(HDC dc, const RECT& client_rect) {
         const bool light_theme = IsLightTaskbarTheme();
         const WidgetPalette palette = GetWidgetPalette(light_theme);
         HBRUSH background_brush = CreateSolidBrush(palette.background);
@@ -434,14 +405,14 @@ private:
         const int vertical_padding = ScaleByDpi(current_dpi_, 4);
         const int line_gap = ScaleByDpi(current_dpi_, 2);
 
-        RECT line1_rect{horizontal_padding,
-                        vertical_padding,
+        RECT line1_rect{client_rect.left + horizontal_padding,
+                        client_rect.top + vertical_padding,
                         client_rect.right - horizontal_padding,
-                        vertical_padding + text_line_height_};
-        RECT line2_rect{horizontal_padding,
-                        vertical_padding + text_line_height_ + line_gap,
+                        client_rect.top + vertical_padding + text_line_height_};
+        RECT line2_rect{client_rect.left + horizontal_padding,
+                        client_rect.top + vertical_padding + text_line_height_ + line_gap,
                         client_rect.right - horizontal_padding,
-                        vertical_padding + text_line_height_ * 2 + line_gap};
+                        client_rect.top + vertical_padding + text_line_height_ * 2 + line_gap};
 
         SetTextColor(dc, palette.primary_text);
         DrawTextW(dc,
@@ -458,6 +429,124 @@ private:
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
 
         SelectObject(dc, old_font);
+    }
+
+    bool RenderLayeredWidget() {
+        if (widget_window_ == nullptr || !IsWindow(widget_window_)) {
+            return false;
+        }
+
+        RECT window_rect{};
+        if (!GetWindowRect(widget_window_, &window_rect)) {
+            return false;
+        }
+
+        const int width = window_rect.right - window_rect.left;
+        const int height = window_rect.bottom - window_rect.top;
+        if (width <= 0 || height <= 0) {
+            return false;
+        }
+
+        HDC screen_dc = GetDC(nullptr);
+        HDC memory_dc = CreateCompatibleDC(screen_dc);
+
+        BITMAPINFO bitmap_info{};
+        bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
+        bitmap_info.bmiHeader.biWidth = width;
+        bitmap_info.bmiHeader.biHeight = -height;
+        bitmap_info.bmiHeader.biPlanes = 1;
+        bitmap_info.bmiHeader.biBitCount = 32;
+        bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+        void* bitmap_bits = nullptr;
+        HBITMAP bitmap =
+            CreateDIBSection(screen_dc, &bitmap_info, DIB_RGB_COLORS, &bitmap_bits, nullptr, 0);
+        if (bitmap == nullptr || bitmap_bits == nullptr) {
+            if (bitmap != nullptr) {
+                DeleteObject(bitmap);
+            }
+            DeleteDC(memory_dc);
+            ReleaseDC(nullptr, screen_dc);
+            return false;
+        }
+
+        HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
+        RECT client_rect{0, 0, width, height};
+        DrawWidgetContents(memory_dc, client_rect);
+
+        auto* pixels = static_cast<BgraPixel*>(bitmap_bits);
+        const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+        for (size_t i = 0; i < pixel_count; ++i) {
+            pixels[i].alpha = 255;
+        }
+
+        POINT source_point{0, 0};
+        POINT destination_point{window_rect.left, window_rect.top};
+        HWND parent_window = GetParent(widget_window_);
+        if (parent_window != nullptr) {
+            ScreenToClient(parent_window, &destination_point);
+        }
+        SIZE window_size{width, height};
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        const BOOL update_ok =
+            UpdateLayeredWindow(widget_window_, screen_dc, &destination_point, &window_size,
+                                memory_dc, &source_point, 0, &blend, ULW_ALPHA);
+
+        SelectObject(memory_dc, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(memory_dc);
+        ReleaseDC(nullptr, screen_dc);
+        return update_ok != FALSE;
+    }
+
+    void RequestWidgetRedraw() {
+        if (widget_window_ == nullptr || !IsWindow(widget_window_)) {
+            return;
+        }
+
+        if (RenderLayeredWidget()) {
+            return;
+        }
+
+        RedrawWindow(widget_window_,
+                     nullptr,
+                     nullptr,
+                     RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+
+    void SampleAndRefresh() {
+        UpdateDisplayLines(metrics_.Sample());
+        RequestWidgetRedraw();
+    }
+
+    void UpdateLayout() {
+        if (!EnsureWidgetWindow()) {
+            return;
+        }
+
+        if (!embedder_.IsAttached()) {
+            ReattachWidget();
+            return;
+        }
+
+        const UINT previous_dpi = current_dpi_;
+        RefreshFontAndSize();
+        if (current_dpi_ != previous_dpi) {
+            RequestWidgetRedraw();
+        }
+        if (!embedder_.RefreshLayout(widget_window_, widget_size_)) {
+            ShowWindow(widget_window_, SW_HIDE);
+            SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
+        }
+    }
+
+    void PaintWidget() {
+        PAINTSTRUCT paint_struct{};
+        HDC dc = BeginPaint(widget_window_, &paint_struct);
+
+        RECT client_rect{};
+        GetClientRect(widget_window_, &client_rect);
+        DrawWidgetContents(dc, client_rect);
         EndPaint(widget_window_, &paint_struct);
     }
 
