@@ -331,12 +331,16 @@ public:
 
 private:
     void RegisterWindowClasses() const {
+        HICON app_icon = LoadIconW(instance_handle_, MAKEINTRESOURCEW(IDI_APP_ICON));
+
         WNDCLASSEXW controller_class{};
         controller_class.cbSize = sizeof(controller_class);
         controller_class.lpfnWndProc = &MonitorApp::ControllerWindowProc;
         controller_class.hInstance = instance_handle_;
         controller_class.lpszClassName = kControllerClassName;
         controller_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        controller_class.hIcon = app_icon;
+        controller_class.hIconSm = app_icon;
         RegisterClassExW(&controller_class);
 
         WNDCLASSEXW widget_class{};
@@ -346,6 +350,8 @@ private:
         widget_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         widget_class.hbrBackground = nullptr;
         widget_class.lpszClassName = kWidgetClassName;
+        widget_class.hIcon = app_icon;
+        widget_class.hIconSm = app_icon;
         RegisterClassExW(&widget_class);
     }
 

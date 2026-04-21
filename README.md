@@ -33,4 +33,3 @@ cmake --build build --config Release
 - Win10 使用“压缩任务按钮区域并插入窗口”的方式。
 - Win11 使用“贴近通知区左侧”的方式。
 - 不支持Win7
-
