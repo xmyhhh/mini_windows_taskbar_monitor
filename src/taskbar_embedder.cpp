@@ -118,6 +118,14 @@ bool TaskbarEmbedder::RefreshLayout(HWND widget_window, const SIZE& desired_size
     }
 
     if (mode_ == Mode::kWin10Classic) {
+        if (!IsHandleAlive(task_list_window_) || GetParent(widget_window) != parent_window_) {
+            if (!Attach(widget_window)) {
+                return false;
+            }
+        }
+    }
+
+    if (mode_ == Mode::kWin10Classic) {
         return LayoutClassic(widget_window, desired_size, QueryTaskbarEdge());
     }
     return LayoutNearTray(widget_window, desired_size);
@@ -162,7 +170,7 @@ bool TaskbarEmbedder::ResolveClassicHandles() {
 
     tray_notify_window_ = FindWindowExW(taskbar_window_, nullptr, L"TrayNotifyWnd", nullptr);
     mode_ = Mode::kWin10Classic;
-    return IsHandleAlive(parent_window_);
+    return IsHandleAlive(parent_window_) && IsHandleAlive(task_list_window_);
 }
 
 bool TaskbarEmbedder::ResolveWin11Handles() {
@@ -181,7 +189,7 @@ bool TaskbarEmbedder::LayoutClassic(HWND widget_window,
     }
 
     if (!IsHandleAlive(task_list_window_)) {
-        return LayoutNearTray(widget_window, desired_size);
+        return false;
     }
 
     RECT parent_rect{};
@@ -194,19 +202,34 @@ bool TaskbarEmbedder::LayoutClassic(HWND widget_window,
     OffsetRect(&task_list_rect, -parent_rect.left, -parent_rect.top);
 
     const bool horizontal = (taskbar_edge == ABE_BOTTOM || taskbar_edge == ABE_TOP);
+    const bool desired_size_changed =
+        desired_size.cx != last_desired_size_.cx || desired_size.cy != last_desired_size_.cy;
+    if (desired_size_changed) {
+        RestoreClassicReservation();
+        if (!GetWindowRect(parent_window_, &parent_rect) ||
+            !GetWindowRect(task_list_window_, &task_list_rect)) {
+            return false;
+        }
+        OffsetRect(&task_list_rect, -parent_rect.left, -parent_rect.top);
+    }
+
     if (horizontal) {
-        const int base_width = RectWidth(task_list_rect) + reserved_extent_;
         const int desired_width = static_cast<int>(desired_size.cx);
         const int desired_height = static_cast<int>(desired_size.cy);
-        const int new_task_list_width = std::max<int>(0, base_width - desired_width);
-        MoveWindow(task_list_window_,
-                   task_list_rect.left,
-                   task_list_rect.top,
-                   new_task_list_width,
-                   RectHeight(task_list_rect),
-                   TRUE);
+        if (desired_size_changed || RectWidth(task_list_rect) != last_task_list_width_) {
+            original_task_list_rect_ = task_list_rect;
+            classic_left_space_ = task_list_rect.left;
+            const int new_task_list_width = std::max<int>(0, RectWidth(task_list_rect) - desired_width);
+            MoveWindow(task_list_window_,
+                       classic_left_space_,
+                       task_list_rect.top,
+                       new_task_list_width,
+                       RectHeight(task_list_rect),
+                       TRUE);
+            last_task_list_width_ = new_task_list_width;
+        }
 
-        const int x = task_list_rect.left + new_task_list_width;
+        const int x = classic_left_space_ + last_task_list_width_ + ScaleByDpi(CurrentDpi(), 2);
         const int y = std::max<int>(0, (RectHeight(parent_rect) - desired_height) / 2);
         SetWindowPos(widget_window,
                      HWND_TOP,
@@ -215,23 +238,28 @@ bool TaskbarEmbedder::LayoutClassic(HWND widget_window,
                      desired_width,
                      desired_height,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        reserved_extent_ = desired_width;
+        last_desired_size_ = desired_size;
         return true;
     }
 
-    const int base_height = RectHeight(task_list_rect) + reserved_extent_;
     const int desired_width = static_cast<int>(desired_size.cx);
     const int desired_height = static_cast<int>(desired_size.cy);
-    const int new_task_list_height = std::max<int>(0, base_height - desired_height);
-    MoveWindow(task_list_window_,
-               task_list_rect.left,
-               task_list_rect.top,
-               RectWidth(task_list_rect),
-               new_task_list_height,
-               TRUE);
+    if (desired_size_changed || RectHeight(task_list_rect) != last_task_list_height_) {
+        original_task_list_rect_ = task_list_rect;
+        classic_top_space_ = task_list_rect.top;
+        const int new_task_list_height =
+            std::max<int>(0, RectHeight(task_list_rect) - desired_height);
+        MoveWindow(task_list_window_,
+                   task_list_rect.left,
+                   classic_top_space_,
+                   RectWidth(task_list_rect),
+                   new_task_list_height,
+                   TRUE);
+        last_task_list_height_ = new_task_list_height;
+    }
 
     const int x = std::max<int>(0, (RectWidth(parent_rect) - desired_width) / 2);
-    const int y = task_list_rect.top + new_task_list_height;
+    const int y = classic_top_space_ + last_task_list_height_ + ScaleByDpi(CurrentDpi(), 2);
     SetWindowPos(widget_window,
                  HWND_TOP,
                  x,
@@ -239,7 +267,7 @@ bool TaskbarEmbedder::LayoutClassic(HWND widget_window,
                  desired_width,
                  desired_height,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    reserved_extent_ = desired_height;
+    last_desired_size_ = desired_size;
     return true;
 }
 
@@ -280,41 +308,46 @@ bool TaskbarEmbedder::LayoutNearTray(HWND widget_window, const SIZE& desired_siz
 }
 
 void TaskbarEmbedder::RestoreClassicReservation() {
-    if (mode_ != Mode::kWin10Classic || reserved_extent_ <= 0 || !IsHandleAlive(task_list_window_)) {
-        reserved_extent_ = 0;
+    if (mode_ != Mode::kWin10Classic || !IsHandleAlive(task_list_window_)) {
+        SetRectEmpty(&original_task_list_rect_);
+        classic_left_space_ = 0;
+        classic_top_space_ = 0;
+        last_task_list_width_ = 0;
+        last_task_list_height_ = 0;
+        last_desired_size_ = {};
         return;
     }
 
-    RECT taskbar_rect{};
-    RECT parent_rect{};
-    RECT task_list_rect{};
-    if (!GetWindowRect(taskbar_window_, &taskbar_rect) ||
-        !GetWindowRect(parent_window_, &parent_rect) ||
-        !GetWindowRect(task_list_window_, &task_list_rect)) {
-        reserved_extent_ = 0;
+    if (IsRectEmpty(&original_task_list_rect_)) {
+        last_task_list_width_ = 0;
+        last_task_list_height_ = 0;
+        last_desired_size_ = {};
         return;
     }
 
-    OffsetRect(&task_list_rect, -parent_rect.left, -parent_rect.top);
-
-    const bool horizontal = RectWidth(taskbar_rect) >= RectHeight(taskbar_rect);
+    const bool horizontal = (QueryTaskbarEdge() == ABE_BOTTOM || QueryTaskbarEdge() == ABE_TOP);
     if (horizontal) {
         MoveWindow(task_list_window_,
-                   task_list_rect.left,
-                   task_list_rect.top,
-                   RectWidth(task_list_rect) + reserved_extent_,
-                   RectHeight(task_list_rect),
+                   classic_left_space_,
+                   original_task_list_rect_.top,
+                   RectWidth(original_task_list_rect_),
+                   RectHeight(original_task_list_rect_),
                    TRUE);
     } else {
         MoveWindow(task_list_window_,
-                   task_list_rect.left,
-                   task_list_rect.top,
-                   RectWidth(task_list_rect),
-                   RectHeight(task_list_rect) + reserved_extent_,
+                   original_task_list_rect_.left,
+                   classic_top_space_,
+                   RectWidth(original_task_list_rect_),
+                   RectHeight(original_task_list_rect_),
                    TRUE);
     }
 
-    reserved_extent_ = 0;
+    SetRectEmpty(&original_task_list_rect_);
+    classic_left_space_ = 0;
+    classic_top_space_ = 0;
+    last_task_list_width_ = 0;
+    last_task_list_height_ = 0;
+    last_desired_size_ = {};
 }
 
 bool TaskbarEmbedder::IsHandleAlive(HWND window_handle) const {

@@ -37,7 +37,12 @@ private:
     HWND task_list_window_{nullptr};
     HWND tray_notify_window_{nullptr};
     HWND start_button_window_{nullptr};
-    int reserved_extent_{0};
+    RECT original_task_list_rect_{};
+    int classic_left_space_{0};
+    int classic_top_space_{0};
+    int last_task_list_width_{0};
+    int last_task_list_height_{0};
+    SIZE last_desired_size_{};
 };
 
 }  // namespace minimal_taskbar_monitor
