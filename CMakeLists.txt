@@ -4,6 +4,7 @@ project(minimal_taskbar_monitor LANGUAGES CXX)
 
 add_executable(minimal_taskbar_monitor WIN32
     src/main.cpp
+    src/app_config.cpp
     src/system_metrics.cpp
     src/taskbar_embedder.cpp
 )

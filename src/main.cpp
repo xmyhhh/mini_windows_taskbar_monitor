@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "system_metrics.h"
 #include "taskbar_embedder.h"
 
@@ -24,6 +25,13 @@ constexpr UINT kTrayIconCallbackMessage = WM_APP + 1;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kExitCommandId = 1001;
 constexpr UINT kAutoStartCommandId = 1002;
+constexpr UINT kMetricCpuCommandId = 1101;
+constexpr UINT kMetricMemoryCommandId = 1102;
+constexpr UINT kMetricUploadCommandId = 1103;
+constexpr UINT kMetricDownloadCommandId = 1104;
+constexpr UINT kMetricGpuCommandId = 1105;
+constexpr UINT kMetricDiskReadCommandId = 1106;
+constexpr UINT kMetricDiskWriteCommandId = 1107;
 constexpr wchar_t kRunRegistryPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValueName[] = L"MinimalTaskbarMonitor";
 
@@ -50,6 +58,14 @@ WidgetPalette GetWidgetPalette(bool light_theme) {
         return {RGB(244, 246, 248), RGB(211, 216, 222), RGB(24, 28, 32), RGB(84, 91, 99)};
     }
     return {RGB(36, 39, 45), RGB(67, 72, 80), RGB(245, 247, 250), RGB(181, 188, 198)};
+}
+
+int CountVisibleMetrics(const MetricVisibility& visibility) {
+    return static_cast<int>(visibility.show_cpu) + static_cast<int>(visibility.show_memory) +
+           static_cast<int>(visibility.show_upload) +
+           static_cast<int>(visibility.show_download) + static_cast<int>(visibility.show_gpu) +
+           static_cast<int>(visibility.show_disk_read) +
+           static_cast<int>(visibility.show_disk_write);
 }
 
 std::wstring GetExecutablePath() {
@@ -162,6 +178,8 @@ public:
     int Run(HINSTANCE instance_handle, int) {
         instance_handle_ = instance_handle;
         taskbar_created_message_ = RegisterWindowMessageW(L"TaskbarCreated");
+        app_config_ = LoadAppConfig();
+        SaveAppConfig(app_config_);
 
         RegisterWindowClasses();
 
@@ -214,7 +232,8 @@ private:
     }
 
     bool Initialize() {
-        UpdateDisplayLines(metrics_.Sample());
+        last_snapshot_ = metrics_.Sample();
+        UpdateDisplayLines(last_snapshot_);
         if (!EnsureWidgetWindow()) {
             return false;
         }
@@ -357,7 +376,7 @@ private:
         HGDIOBJ old_font = SelectObject(screen_dc, active_font);
         SIZE line1_size{};
         SIZE line2_size{};
-        const DisplayLines sample_lines = GetMetricsSampleLines();
+        const DisplayLines sample_lines = GetMetricsSampleLines(app_config_.visible_metrics);
         GetTextExtentPoint32W(screen_dc,
                               sample_lines.line1.c_str(),
                               static_cast<int>(sample_lines.line1.size()),
@@ -375,16 +394,20 @@ private:
         const int horizontal_padding = ScaleByDpi(current_dpi_, 8);
         const int vertical_padding = ScaleByDpi(current_dpi_, 5);
         const int line_gap = ScaleByDpi(current_dpi_, 2);
+        const bool has_second_line = !sample_lines.line2.empty();
 
         widget_size_.cx = std::max(line1_size.cx, line2_size.cx) + horizontal_padding * 2;
-        widget_size_.cy = std::max<int>(text_line_height_ * 2 + line_gap + vertical_padding * 2,
-                                        ScaleByDpi(current_dpi_, 32));
+        widget_size_.cy =
+            std::max<int>((has_second_line ? text_line_height_ * 2 + line_gap : text_line_height_) +
+                              vertical_padding * 2,
+                          ScaleByDpi(current_dpi_, has_second_line ? 32 : 24));
     }
 
     void UpdateDisplayLines(const MetricsSnapshot& snapshot) {
-        const DisplayLines lines = FormatMetricsLines(snapshot);
+        const DisplayLines lines = FormatMetricsLines(snapshot, app_config_.visible_metrics);
         line1_text_ = lines.line1;
         line2_text_ = lines.line2;
+        has_second_line_ = !line2_text_.empty();
     }
 
     void DrawWidgetContents(HDC dc, const RECT& client_rect) {
@@ -404,11 +427,15 @@ private:
         const int horizontal_padding = ScaleByDpi(current_dpi_, 8);
         const int vertical_padding = ScaleByDpi(current_dpi_, 4);
         const int line_gap = ScaleByDpi(current_dpi_, 2);
+        const int centered_offset = std::max<int>(
+            0, ((client_rect.bottom - client_rect.top) - text_line_height_) / 2);
+        const int line1_top =
+            has_second_line_ ? client_rect.top + vertical_padding : client_rect.top + centered_offset;
 
         RECT line1_rect{client_rect.left + horizontal_padding,
-                        client_rect.top + vertical_padding,
+                        line1_top,
                         client_rect.right - horizontal_padding,
-                        client_rect.top + vertical_padding + text_line_height_};
+                        line1_top + text_line_height_};
         RECT line2_rect{client_rect.left + horizontal_padding,
                         client_rect.top + vertical_padding + text_line_height_ + line_gap,
                         client_rect.right - horizontal_padding,
@@ -421,12 +448,14 @@ private:
                   &line1_rect,
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-        SetTextColor(dc, palette.secondary_text);
-        DrawTextW(dc,
-                  line2_text_.c_str(),
-                  static_cast<int>(line2_text_.size()),
-                  &line2_rect,
-                  DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+        if (has_second_line_) {
+            SetTextColor(dc, palette.secondary_text);
+            DrawTextW(dc,
+                      line2_text_.c_str(),
+                      static_cast<int>(line2_text_.size()),
+                      &line2_rect,
+                      DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
 
         SelectObject(dc, old_font);
     }
@@ -515,8 +544,76 @@ private:
     }
 
     void SampleAndRefresh() {
-        UpdateDisplayLines(metrics_.Sample());
+        last_snapshot_ = metrics_.Sample();
+        UpdateDisplayLines(last_snapshot_);
         RequestWidgetRedraw();
+    }
+
+    bool SaveConfig() const {
+        return SaveAppConfig(app_config_);
+    }
+
+    void ApplyMetricVisibilityChange() {
+        UpdateDisplayLines(last_snapshot_);
+        RefreshFontAndSize();
+        if (embedder_.IsAttached()) {
+            if (!embedder_.RefreshLayout(widget_window_, widget_size_)) {
+                ShowWindow(widget_window_, SW_HIDE);
+                SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
+                return;
+            }
+        }
+        RequestWidgetRedraw();
+    }
+
+    bool ToggleMetricVisibility(UINT command_id) {
+        bool* target = nullptr;
+        switch (command_id) {
+        case kMetricCpuCommandId:
+            target = &app_config_.visible_metrics.show_cpu;
+            break;
+        case kMetricMemoryCommandId:
+            target = &app_config_.visible_metrics.show_memory;
+            break;
+        case kMetricUploadCommandId:
+            target = &app_config_.visible_metrics.show_upload;
+            break;
+        case kMetricDownloadCommandId:
+            target = &app_config_.visible_metrics.show_download;
+            break;
+        case kMetricGpuCommandId:
+            target = &app_config_.visible_metrics.show_gpu;
+            break;
+        case kMetricDiskReadCommandId:
+            target = &app_config_.visible_metrics.show_disk_read;
+            break;
+        case kMetricDiskWriteCommandId:
+            target = &app_config_.visible_metrics.show_disk_write;
+            break;
+        default:
+            return false;
+        }
+
+        if (*target && CountVisibleMetrics(app_config_.visible_metrics) <= 1) {
+            MessageBoxW(controller_window_,
+                        L"Keep at least one metric visible.",
+                        L"Minimal Taskbar Monitor",
+                        MB_OK | MB_ICONINFORMATION);
+            return true;
+        }
+
+        *target = !*target;
+        if (!SaveConfig()) {
+            *target = !*target;
+            MessageBoxW(controller_window_,
+                        L"Unable to save the local config file.",
+                        L"Minimal Taskbar Monitor",
+                        MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        ApplyMetricVisibilityChange();
+        return true;
     }
 
     void UpdateLayout() {
@@ -562,6 +659,46 @@ private:
 
     void ShowContextMenu(POINT screen_point) {
         HMENU menu = CreatePopupMenu();
+        HMENU metrics_menu = CreatePopupMenu();
+        AppendMenuW(metrics_menu,
+                    MF_STRING | (app_config_.visible_metrics.show_cpu ? MF_CHECKED : MF_UNCHECKED),
+                    kMetricCpuCommandId,
+                    L"CPU Usage");
+        AppendMenuW(metrics_menu,
+                    MF_STRING |
+                        (app_config_.visible_metrics.show_memory ? MF_CHECKED : MF_UNCHECKED),
+                    kMetricMemoryCommandId,
+                    L"Memory");
+        AppendMenuW(metrics_menu,
+                    MF_STRING |
+                        (app_config_.visible_metrics.show_upload ? MF_CHECKED : MF_UNCHECKED),
+                    kMetricUploadCommandId,
+                    L"Upload Speed");
+        AppendMenuW(metrics_menu,
+                    MF_STRING |
+                        (app_config_.visible_metrics.show_download ? MF_CHECKED : MF_UNCHECKED),
+                    kMetricDownloadCommandId,
+                    L"Download Speed");
+        AppendMenuW(metrics_menu,
+                    MF_STRING | (app_config_.visible_metrics.show_gpu ? MF_CHECKED : MF_UNCHECKED),
+                    kMetricGpuCommandId,
+                    L"GPU Usage");
+        AppendMenuW(metrics_menu,
+                    MF_STRING |
+                        (app_config_.visible_metrics.show_disk_read ? MF_CHECKED : MF_UNCHECKED),
+                    kMetricDiskReadCommandId,
+                    L"Disk Read");
+        AppendMenuW(metrics_menu,
+                    MF_STRING |
+                        (app_config_.visible_metrics.show_disk_write ? MF_CHECKED : MF_UNCHECKED),
+                    kMetricDiskWriteCommandId,
+                    L"Disk Write");
+
+        AppendMenuW(menu,
+                    MF_POPUP,
+                    reinterpret_cast<UINT_PTR>(metrics_menu),
+                    L"Visible Metrics");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         const UINT auto_start_flags =
             MF_STRING | (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED);
         AppendMenuW(menu, auto_start_flags, kAutoStartCommandId, L"Launch at startup");
@@ -575,6 +712,9 @@ private:
         DestroyMenu(menu);
         PostMessageW(controller_window_, WM_NULL, 0, 0);
 
+        if (ToggleMetricVisibility(command)) {
+            return;
+        }
         if (command == kAutoStartCommandId) {
             ToggleAutoStart();
             return;
@@ -644,7 +784,7 @@ private:
         case WM_SETTINGCHANGE:
             app->RefreshFontAndSize();
             if (app->widget_window_ != nullptr && IsWindow(app->widget_window_)) {
-                InvalidateRect(app->widget_window_, nullptr, TRUE);
+                app->RequestWidgetRedraw();
             }
             return 0;
         case WM_CLOSE:
@@ -727,11 +867,14 @@ private:
     UINT taskbar_created_message_{0};
     SIZE widget_size_{};
     int text_line_height_{0};
+    bool has_second_line_{true};
     bool is_shutting_down_{false};
     bool tray_icon_added_{false};
     HICON tray_icon_handle_{nullptr};
+    AppConfig app_config_{};
+    MetricsSnapshot last_snapshot_{};
     std::wstring line1_text_{L"CPU 0%  MEM 0%"};
-    std::wstring line2_text_{L"UP 0B/s  DN 0B/s  GPU --"};
+    std::wstring line2_text_{L"\u2191 0B/s  \u2193 0B/s  R 0B/s  W 0B/s"};
     SystemMetrics metrics_{};
     TaskbarEmbedder embedder_{};
 };

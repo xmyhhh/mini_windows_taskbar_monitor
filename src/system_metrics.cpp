@@ -17,7 +17,11 @@ namespace minimal_taskbar_monitor {
 
 namespace {
 
+constexpr wchar_t kCpuUtilityCounterPath[] = L"\\Processor Information(_Total)\\% Processor Utility";
+constexpr wchar_t kCpuTimeCounterPath[] = L"\\Processor(_Total)\\% Processor Time";
 constexpr wchar_t kGpuCounterPath[] = L"\\GPU Engine(*)\\Utilization Percentage";
+constexpr wchar_t kDiskReadCounterPath[] = L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec";
+constexpr wchar_t kDiskWriteCounterPath[] = L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec";
 constexpr wchar_t kThemeRegistryPath[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 constexpr wchar_t kThemeRegistryValue[] = L"SystemUsesLightTheme";
@@ -60,36 +64,59 @@ bool QueryThemeValue(DWORD& value) {
                         &value_size) == ERROR_SUCCESS;
 }
 
-}  // namespace
-
-SystemMetrics::SystemMetrics() {
-    auto* query = new PDH_HQUERY{};
-    auto* counter = new PDH_HCOUNTER{};
-    pdh_query_ = query;
-    pdh_counter_ = counter;
-
-    if (PdhOpenQueryW(nullptr, 0, query) == ERROR_SUCCESS) {
-        PDH_STATUS status = PdhAddCounterW(*query, kGpuCounterPath, 0, counter);
-        if (status != ERROR_SUCCESS) {
-            status = PdhAddEnglishCounterW(*query, kGpuCounterPath, 0, counter);
+std::wstring JoinSegments(const std::vector<std::wstring>& segments) {
+    std::wstring result;
+    for (size_t index = 0; index < segments.size(); ++index) {
+        if (index != 0) {
+            result += L"  ";
         }
-        if (status == ERROR_SUCCESS) {
-            PdhCollectQueryData(*query);
-            gpu_query_initialized_ = true;
-        }
+        result += segments[index];
+    }
+    return result;
+}
+
+void NormalizeDisplayLines(DisplayLines& lines) {
+    if (lines.line1.empty() && !lines.line2.empty()) {
+        lines.line1 = lines.line2;
+        lines.line2.clear();
+    }
+    if (lines.line1.empty()) {
+        lines.line1 = L"No metrics";
     }
 }
 
-SystemMetrics::~SystemMetrics() {
-    auto* query = static_cast<PDH_HQUERY*>(pdh_query_);
-    auto* counter = static_cast<PDH_HCOUNTER*>(pdh_counter_);
+void CloseQueryIfNeeded(PDH_HQUERY& query_handle) {
+    if (query_handle != nullptr) {
+        PdhCloseQuery(query_handle);
+        query_handle = nullptr;
+    }
+}
 
-    if (query != nullptr && *query != nullptr) {
-        PdhCloseQuery(*query);
+}  // namespace
+
+SystemMetrics::SystemMetrics() {
+    InitializeCounterQuery(
+        cpu_query_, cpu_query_initialized_, kCpuTimeCounterPath, cpu_counter_);
+    if (!cpu_query_initialized_) {
+        InitializeCounterQuery(
+            cpu_query_, cpu_query_initialized_, kCpuUtilityCounterPath, cpu_counter_);
     }
 
-    delete counter;
-    delete query;
+    InitializeCounterQuery(
+        gpu_query_, gpu_query_initialized_, kGpuCounterPath, gpu_counter_);
+
+    InitializeCounterQuery(disk_query_,
+                           disk_query_initialized_,
+                           kDiskReadCounterPath,
+                           disk_read_counter_,
+                           kDiskWriteCounterPath,
+                           &disk_write_counter_);
+}
+
+SystemMetrics::~SystemMetrics() {
+    CloseQueryIfNeeded(cpu_query_);
+    CloseQueryIfNeeded(gpu_query_);
+    CloseQueryIfNeeded(disk_query_);
 }
 
 MetricsSnapshot SystemMetrics::Sample() {
@@ -98,10 +125,94 @@ MetricsSnapshot SystemMetrics::Sample() {
     snapshot.memory_percent = SampleMemoryPercent();
     snapshot.gpu_percent = SampleGpuPercent();
     SampleNetwork(snapshot.download_bytes_per_second, snapshot.upload_bytes_per_second);
+    SampleDisk(snapshot.disk_read_bytes_per_second, snapshot.disk_write_bytes_per_second);
     return snapshot;
 }
 
+bool SystemMetrics::InitializeCounterQuery(PDH_HQUERY& query_handle,
+                                           bool& initialized,
+                                           const wchar_t* primary_counter_path,
+                                           PDH_HCOUNTER& primary_counter,
+                                           const wchar_t* secondary_counter_path,
+                                           PDH_HCOUNTER* secondary_counter) {
+    initialized = false;
+    primary_counter = nullptr;
+    if (secondary_counter != nullptr) {
+        *secondary_counter = nullptr;
+    }
+
+    CloseQueryIfNeeded(query_handle);
+    if (PdhOpenQueryW(nullptr, 0, &query_handle) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    if (!AddCounterWithFallback(query_handle, primary_counter_path, primary_counter)) {
+        CloseQueryIfNeeded(query_handle);
+        return false;
+    }
+
+    if (secondary_counter_path != nullptr && secondary_counter != nullptr &&
+        !AddCounterWithFallback(query_handle, secondary_counter_path, *secondary_counter)) {
+        CloseQueryIfNeeded(query_handle);
+        primary_counter = nullptr;
+        *secondary_counter = nullptr;
+        return false;
+    }
+
+    if (PdhCollectQueryData(query_handle) != ERROR_SUCCESS) {
+        CloseQueryIfNeeded(query_handle);
+        primary_counter = nullptr;
+        if (secondary_counter != nullptr) {
+            *secondary_counter = nullptr;
+        }
+        return false;
+    }
+
+    initialized = true;
+    return true;
+}
+
+bool SystemMetrics::AddCounterWithFallback(PDH_HQUERY query_handle,
+                                           const wchar_t* counter_path,
+                                           PDH_HCOUNTER& counter_handle) {
+    counter_handle = nullptr;
+    PDH_STATUS status = PdhAddCounterW(query_handle, counter_path, 0, &counter_handle);
+    if (status != ERROR_SUCCESS) {
+        status = PdhAddEnglishCounterW(query_handle, counter_path, 0, &counter_handle);
+    }
+    return status == ERROR_SUCCESS;
+}
+
+bool SystemMetrics::QueryDoubleCounter(PDH_HCOUNTER counter_handle, double& value) const {
+    PDH_FMT_COUNTERVALUE formatted_value{};
+    if (PdhGetFormattedCounterValue(counter_handle, PDH_FMT_DOUBLE, nullptr, &formatted_value) !=
+            ERROR_SUCCESS ||
+        (formatted_value.CStatus != ERROR_SUCCESS &&
+         formatted_value.CStatus != PDH_CSTATUS_VALID_DATA &&
+         formatted_value.CStatus != PDH_CSTATUS_NEW_DATA)) {
+        value = 0.0;
+        return false;
+    }
+
+    value = formatted_value.doubleValue;
+    return true;
+}
+
 int SystemMetrics::SampleCpuPercent() {
+    if (cpu_query_initialized_) {
+        if (PdhCollectQueryData(cpu_query_) == ERROR_SUCCESS) {
+            double value = 0.0;
+            if (QueryDoubleCounter(cpu_counter_, value)) {
+                const int percent = static_cast<int>(std::lround(value));
+                return std::clamp(percent, 0, 100);
+            }
+        }
+    }
+
+    return SampleCpuPercentWithSystemTimesFallback();
+}
+
+int SystemMetrics::SampleCpuPercentWithSystemTimesFallback() {
     FILETIME idle_time{};
     FILETIME kernel_time{};
     FILETIME user_time{};
@@ -154,16 +265,14 @@ int SystemMetrics::SampleGpuPercent() {
         return -1;
     }
 
-    auto* query = static_cast<PDH_HQUERY*>(pdh_query_);
-    auto* counter = static_cast<PDH_HCOUNTER*>(pdh_counter_);
-    if (PdhCollectQueryData(*query) != ERROR_SUCCESS) {
+    if (PdhCollectQueryData(gpu_query_) != ERROR_SUCCESS) {
         return -1;
     }
 
     DWORD buffer_size = 0;
     DWORD item_count = 0;
     PDH_STATUS status =
-        PdhGetFormattedCounterArrayW(*counter, PDH_FMT_DOUBLE, &buffer_size, &item_count, nullptr);
+        PdhGetFormattedCounterArrayW(gpu_counter_, PDH_FMT_DOUBLE, &buffer_size, &item_count, nullptr);
     if (status != PDH_MORE_DATA || buffer_size == 0) {
         return -1;
     }
@@ -171,13 +280,19 @@ int SystemMetrics::SampleGpuPercent() {
     std::vector<BYTE> buffer(buffer_size);
     auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
     status = PdhGetFormattedCounterArrayW(
-        *counter, PDH_FMT_DOUBLE, &buffer_size, &item_count, items);
+        gpu_counter_, PDH_FMT_DOUBLE, &buffer_size, &item_count, items);
     if (status != ERROR_SUCCESS) {
         return -1;
     }
 
     std::map<std::wstring, double> usage_by_engine;
     for (DWORD i = 0; i < item_count; ++i) {
+        if (items[i].FmtValue.CStatus != ERROR_SUCCESS &&
+            items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA &&
+            items[i].FmtValue.CStatus != PDH_CSTATUS_NEW_DATA) {
+            continue;
+        }
+
         std::wstring engine_name = items[i].szName ? items[i].szName : L"";
         const size_t suffix_pos = engine_name.rfind(L'_');
         if (suffix_pos != std::wstring::npos && suffix_pos + 1 < engine_name.size()) {
@@ -233,6 +348,29 @@ void SystemMetrics::SampleNetwork(unsigned long long& download_bytes_per_second,
     last_network_tick_ = now;
 }
 
+void SystemMetrics::SampleDisk(unsigned long long& read_bytes_per_second,
+                               unsigned long long& write_bytes_per_second) {
+    read_bytes_per_second = 0;
+    write_bytes_per_second = 0;
+
+    if (!disk_query_initialized_) {
+        return;
+    }
+
+    if (PdhCollectQueryData(disk_query_) != ERROR_SUCCESS) {
+        return;
+    }
+
+    double read_value = 0.0;
+    double write_value = 0.0;
+    if (QueryDoubleCounter(disk_read_counter_, read_value) && read_value > 0.0) {
+        read_bytes_per_second = static_cast<unsigned long long>(std::llround(read_value));
+    }
+    if (QueryDoubleCounter(disk_write_counter_, write_value) && write_value > 0.0) {
+        write_bytes_per_second = static_cast<unsigned long long>(std::llround(write_value));
+    }
+}
+
 bool SystemMetrics::QueryNetworkTotals(unsigned long long& total_in_bytes,
                                        unsigned long long& total_out_bytes) const {
     total_in_bytes = 0;
@@ -265,38 +403,84 @@ bool SystemMetrics::QueryNetworkTotals(unsigned long long& total_in_bytes,
     return true;
 }
 
-DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot) {
+DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
+                                const MetricVisibility& visibility) {
     DisplayLines lines{};
-    const std::wstring up_text = FormatSpeed(snapshot.upload_bytes_per_second);
-    const std::wstring down_text = FormatSpeed(snapshot.download_bytes_per_second);
+    std::vector<std::wstring> line1_segments;
+    std::vector<std::wstring> line2_segments;
 
-    wchar_t line1_buffer[96]{};
-    swprintf_s(line1_buffer,
-               L"CPU %d%%  MEM %d%%",
-               std::max(snapshot.cpu_percent, 0),
-               std::max(snapshot.memory_percent, 0));
-    lines.line1 = line1_buffer;
-
-    wchar_t line2_buffer[160]{};
-    if (snapshot.gpu_percent >= 0) {
-        swprintf_s(line2_buffer,
-                   L"\u2191 %ls  \u2193 %ls  GPU %d%%",
-                   up_text.c_str(),
-                   down_text.c_str(),
-                   snapshot.gpu_percent);
-    } else {
-        swprintf_s(line2_buffer,
-                   L"\u2191 %ls  \u2193 %ls  GPU --",
-                   up_text.c_str(),
-                   down_text.c_str());
+    if (visibility.show_cpu) {
+        line1_segments.push_back(std::wstring(L"CPU ") +
+                                 std::to_wstring(std::max(snapshot.cpu_percent, 0)) + L"%");
     }
-    lines.line2 = line2_buffer;
+    if (visibility.show_memory) {
+        line1_segments.push_back(std::wstring(L"MEM ") +
+                                 std::to_wstring(std::max(snapshot.memory_percent, 0)) + L"%");
+    }
+    if (visibility.show_gpu) {
+        if (snapshot.gpu_percent >= 0) {
+            line1_segments.push_back(std::wstring(L"GPU ") + std::to_wstring(snapshot.gpu_percent) +
+                                     L"%");
+        } else {
+            line1_segments.push_back(L"GPU --");
+        }
+    }
 
+    if (visibility.show_upload) {
+        line2_segments.push_back(std::wstring(L"\u2191 ") +
+                                 FormatSpeed(snapshot.upload_bytes_per_second));
+    }
+    if (visibility.show_download) {
+        line2_segments.push_back(std::wstring(L"\u2193 ") +
+                                 FormatSpeed(snapshot.download_bytes_per_second));
+    }
+    if (visibility.show_disk_read) {
+        line2_segments.push_back(std::wstring(L"R ") +
+                                 FormatSpeed(snapshot.disk_read_bytes_per_second));
+    }
+    if (visibility.show_disk_write) {
+        line2_segments.push_back(std::wstring(L"W ") +
+                                 FormatSpeed(snapshot.disk_write_bytes_per_second));
+    }
+
+    lines.line1 = JoinSegments(line1_segments);
+    lines.line2 = JoinSegments(line2_segments);
+    NormalizeDisplayLines(lines);
     return lines;
 }
 
-DisplayLines GetMetricsSampleLines() {
-    return {L"CPU 100%  MEM 100%", L"\u2191 99.9GB/s  \u2193 99.9GB/s  GPU 100%"};
+DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility) {
+    DisplayLines lines{};
+    std::vector<std::wstring> line1_segments;
+    std::vector<std::wstring> line2_segments;
+
+    if (visibility.show_cpu) {
+        line1_segments.push_back(L"CPU 100%");
+    }
+    if (visibility.show_memory) {
+        line1_segments.push_back(L"MEM 100%");
+    }
+    if (visibility.show_gpu) {
+        line1_segments.push_back(L"GPU 100%");
+    }
+
+    if (visibility.show_upload) {
+        line2_segments.push_back(L"\u2191 99.9GB/s");
+    }
+    if (visibility.show_download) {
+        line2_segments.push_back(L"\u2193 99.9GB/s");
+    }
+    if (visibility.show_disk_read) {
+        line2_segments.push_back(L"R 99.9GB/s");
+    }
+    if (visibility.show_disk_write) {
+        line2_segments.push_back(L"W 99.9GB/s");
+    }
+
+    lines.line1 = JoinSegments(line1_segments);
+    lines.line2 = JoinSegments(line2_segments);
+    NormalizeDisplayLines(lines);
+    return lines;
 }
 
 bool IsLightTaskbarTheme() {
