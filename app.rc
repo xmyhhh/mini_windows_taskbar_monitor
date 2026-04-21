@@ -1,0 +1,3 @@
+#include "src/resource.h"
+
+IDR_APP_LOGO_PNG RCDATA "logo.png"

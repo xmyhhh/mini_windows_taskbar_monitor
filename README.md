@@ -1,10 +1,13 @@
 # minimal_taskbar_monitor
 
+![Logo](logo.png)
+
 一个参考 `TrafficMonitor` 的最小版任务栏性能监视器，只保留：
 
 - Win10 / Win11 任务栏嵌入
 - CPU、内存、上下行网速、GPU 占用
-- 右键退出
+- 托盘图标、右键退出、开机自启动
+- 指标显隐配置与本地 JSON 缓存
 
 不包含以下功能：
 
@@ -28,6 +31,7 @@ cmake --build build --config Release
 
 ## Notes
 
+- `logo.png` 会编译进 exe 资源，作为托盘常驻图标来源，不需要额外分发单独图片文件。
 - 主要适配主显示器上的任务栏。
 - Win10 使用“压缩任务按钮区域并插入窗口”的方式。
 - Win11 使用“贴近通知区左侧”的方式。

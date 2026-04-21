@@ -1,12 +1,18 @@
 #include "app_config.h"
+#include "resource.h"
 #include "system_metrics.h"
 #include "taskbar_embedder.h"
 
 #include <windows.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <shellapi.h>
 #include <windowsx.h>
 
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <memory>
 #include <string>
 
 namespace minimal_taskbar_monitor {
@@ -58,6 +64,118 @@ WidgetPalette GetWidgetPalette(bool light_theme) {
         return {RGB(244, 246, 248), RGB(211, 216, 222), RGB(24, 28, 32), RGB(84, 91, 99)};
     }
     return {RGB(36, 39, 45), RGB(67, 72, 80), RGB(245, 247, 250), RGB(181, 188, 198)};
+}
+
+bool IsNearlyWhite(const Gdiplus::Color& color) {
+    return color.GetAlpha() > 0 && color.GetRed() >= 245 && color.GetGreen() >= 245 &&
+           color.GetBlue() >= 245;
+}
+
+bool FindContentBounds(Gdiplus::Bitmap& bitmap, Gdiplus::Rect& bounds) {
+    const UINT width = bitmap.GetWidth();
+    const UINT height = bitmap.GetHeight();
+    int min_x = static_cast<int>(width);
+    int min_y = static_cast<int>(height);
+    int max_x = -1;
+    int max_y = -1;
+
+    for (UINT y = 0; y < height; ++y) {
+        for (UINT x = 0; x < width; ++x) {
+            Gdiplus::Color color;
+            if (bitmap.GetPixel(x, y, &color) != Gdiplus::Ok || IsNearlyWhite(color)) {
+                continue;
+            }
+
+            min_x = std::min(min_x, static_cast<int>(x));
+            min_y = std::min(min_y, static_cast<int>(y));
+            max_x = std::max(max_x, static_cast<int>(x));
+            max_y = std::max(max_y, static_cast<int>(y));
+        }
+    }
+
+    if (max_x < min_x || max_y < min_y) {
+        return false;
+    }
+
+    bounds = Gdiplus::Rect(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1);
+    return true;
+}
+
+HFONT CreatePreferredUiFont(UINT dpi) {
+    const LOGFONTW font_template{
+        .lfHeight = -ScaleByDpi(dpi, 12),
+        .lfWidth = 0,
+        .lfEscapement = 0,
+        .lfOrientation = 0,
+        .lfWeight = FW_NORMAL,
+        .lfItalic = FALSE,
+        .lfUnderline = FALSE,
+        .lfStrikeOut = FALSE,
+        .lfCharSet = DEFAULT_CHARSET,
+        .lfOutPrecision = OUT_DEFAULT_PRECIS,
+        .lfClipPrecision = CLIP_DEFAULT_PRECIS,
+        .lfQuality = CLEARTYPE_NATURAL_QUALITY,
+        .lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE,
+    };
+
+    const std::array<const wchar_t*, 4> preferred_faces = {
+        L"Segoe UI Variable Text", L"Bahnschrift", L"Microsoft YaHei UI", L"Segoe UI"};
+
+    HDC screen_dc = GetDC(nullptr);
+    if (screen_dc == nullptr) {
+        return CreateFontW(font_template.lfHeight,
+                           0,
+                           0,
+                           0,
+                           FW_NORMAL,
+                           FALSE,
+                           FALSE,
+                           FALSE,
+                           DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS,
+                           CLEARTYPE_NATURAL_QUALITY,
+                           DEFAULT_PITCH | FF_DONTCARE,
+                           L"Segoe UI");
+    }
+
+    for (const wchar_t* face_name : preferred_faces) {
+        LOGFONTW requested_font = font_template;
+        wcscpy_s(requested_font.lfFaceName, face_name);
+
+        HFONT font_handle = CreateFontIndirectW(&requested_font);
+        if (font_handle == nullptr) {
+            continue;
+        }
+
+        HGDIOBJ previous_font = SelectObject(screen_dc, font_handle);
+        wchar_t selected_face[LF_FACESIZE]{};
+        const int face_length = GetTextFaceW(screen_dc, LF_FACESIZE, selected_face);
+        SelectObject(screen_dc, previous_font);
+
+        if (face_length > 0 && _wcsicmp(selected_face, face_name) == 0) {
+            ReleaseDC(nullptr, screen_dc);
+            return font_handle;
+        }
+
+        DeleteObject(font_handle);
+    }
+
+    ReleaseDC(nullptr, screen_dc);
+    return CreateFontW(font_template.lfHeight,
+                       0,
+                       0,
+                       0,
+                       FW_NORMAL,
+                       FALSE,
+                       FALSE,
+                       FALSE,
+                       DEFAULT_CHARSET,
+                       OUT_DEFAULT_PRECIS,
+                       CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_NATURAL_QUALITY,
+                       DEFAULT_PITCH | FF_DONTCARE,
+                       L"Segoe UI");
 }
 
 int CountVisibleMetrics(const MetricVisibility& visibility) {
@@ -272,7 +390,7 @@ private:
         }
 
         if (tray_icon_handle_ == nullptr) {
-            tray_icon_handle_ = LoadIconW(nullptr, IDI_APPLICATION);
+            tray_icon_handle_ = LoadTrayIcon();
         }
 
         NOTIFYICONDATAW notify_icon{};
@@ -309,6 +427,13 @@ private:
         RemoveTrayIcon();
 
         embedder_.Detach(widget_window_);
+
+        if (tray_icon_handle_ != nullptr) {
+            DestroyIcon(tray_icon_handle_);
+            tray_icon_handle_ = nullptr;
+        }
+
+        ShutdownGdiplus();
 
         if (font_ != nullptr) {
             DeleteObject(font_);
@@ -353,21 +478,7 @@ private:
                 font_ = nullptr;
             }
 
-            const int font_height = -ScaleByDpi(current_dpi_, 12);
-            font_ = CreateFontW(font_height,
-                                0,
-                                0,
-                                0,
-                                FW_SEMIBOLD,
-                                FALSE,
-                                FALSE,
-                                FALSE,
-                                DEFAULT_CHARSET,
-                                OUT_DEFAULT_PRECIS,
-                                CLIP_DEFAULT_PRECIS,
-                                ANTIALIASED_QUALITY,
-                                DEFAULT_PITCH | FF_DONTCARE,
-                                L"Segoe UI");
+            font_ = CreatePreferredUiFont(current_dpi_);
         }
 
         HDC screen_dc = GetDC(nullptr);
@@ -724,6 +835,153 @@ private:
         }
     }
 
+    bool EnsureGdiplus() {
+        if (gdiplus_started_) {
+            return true;
+        }
+
+        Gdiplus::GdiplusStartupInput startup_input;
+        const Gdiplus::Status status =
+            Gdiplus::GdiplusStartup(&gdiplus_token_, &startup_input, nullptr);
+        gdiplus_started_ = status == Gdiplus::Ok;
+        if (!gdiplus_started_) {
+            gdiplus_token_ = 0;
+        }
+        return gdiplus_started_;
+    }
+
+    void ShutdownGdiplus() {
+        if (!gdiplus_started_) {
+            return;
+        }
+
+        Gdiplus::GdiplusShutdown(gdiplus_token_);
+        gdiplus_started_ = false;
+        gdiplus_token_ = 0;
+    }
+
+    std::unique_ptr<Gdiplus::Bitmap> LoadLogoBitmapFromResource() {
+        if (!EnsureGdiplus()) {
+            return nullptr;
+        }
+
+        HRSRC resource_info =
+            FindResourceW(instance_handle_, MAKEINTRESOURCEW(IDR_APP_LOGO_PNG), RT_RCDATA);
+        if (resource_info == nullptr) {
+            return nullptr;
+        }
+
+        const DWORD resource_size = SizeofResource(instance_handle_, resource_info);
+        if (resource_size == 0) {
+            return nullptr;
+        }
+
+        HGLOBAL loaded_resource = LoadResource(instance_handle_, resource_info);
+        if (loaded_resource == nullptr) {
+            return nullptr;
+        }
+
+        const void* resource_data = LockResource(loaded_resource);
+        if (resource_data == nullptr) {
+            return nullptr;
+        }
+
+        HGLOBAL resource_copy = GlobalAlloc(GMEM_MOVEABLE, resource_size);
+        if (resource_copy == nullptr) {
+            return nullptr;
+        }
+
+        void* copy_data = GlobalLock(resource_copy);
+        if (copy_data == nullptr) {
+            GlobalFree(resource_copy);
+            return nullptr;
+        }
+
+        memcpy(copy_data, resource_data, resource_size);
+        GlobalUnlock(resource_copy);
+
+        IStream* stream = nullptr;
+        if (CreateStreamOnHGlobal(resource_copy, TRUE, &stream) != S_OK) {
+            GlobalFree(resource_copy);
+            return nullptr;
+        }
+
+        std::unique_ptr<Gdiplus::Bitmap> bitmap(Gdiplus::Bitmap::FromStream(stream, FALSE));
+        stream->Release();
+        if (!bitmap || bitmap->GetLastStatus() != Gdiplus::Ok) {
+            return nullptr;
+        }
+
+        return bitmap;
+    }
+
+    HICON CreateIconFromLogo() {
+        std::unique_ptr<Gdiplus::Bitmap> source_bitmap = LoadLogoBitmapFromResource();
+        if (!source_bitmap) {
+            return nullptr;
+        }
+
+        Gdiplus::Rect content_bounds{};
+        if (!FindContentBounds(*source_bitmap, content_bounds)) {
+            content_bounds =
+                Gdiplus::Rect(0, 0, static_cast<INT>(source_bitmap->GetWidth()),
+                              static_cast<INT>(source_bitmap->GetHeight()));
+        }
+
+        const int icon_size = std::max({GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 32});
+        const int padding = std::max(2, icon_size / 12);
+        const int available_width = std::max(1, icon_size - padding * 2);
+        const int available_height = std::max(1, icon_size - padding * 2);
+        const double scale =
+            std::min(static_cast<double>(available_width) / std::max(content_bounds.Width, 1),
+                     static_cast<double>(available_height) / std::max(content_bounds.Height, 1));
+        const int draw_width = std::max(1, static_cast<int>(content_bounds.Width * scale));
+        const int draw_height = std::max(1, static_cast<int>(content_bounds.Height * scale));
+        const int offset_x = (icon_size - draw_width) / 2;
+        const int offset_y = (icon_size - draw_height) / 2;
+
+        Gdiplus::Bitmap icon_bitmap(icon_size, icon_size, PixelFormat32bppARGB);
+        Gdiplus::Graphics graphics(&icon_bitmap);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+
+        Gdiplus::ImageAttributes image_attributes;
+        image_attributes.SetColorKey(Gdiplus::Color(245, 245, 245),
+                                     Gdiplus::Color(255, 255, 255),
+                                     Gdiplus::ColorAdjustTypeBitmap);
+
+        const Gdiplus::Rect destination_rect(offset_x, offset_y, draw_width, draw_height);
+        if (graphics.DrawImage(source_bitmap.get(),
+                               destination_rect,
+                               content_bounds.X,
+                               content_bounds.Y,
+                               content_bounds.Width,
+                               content_bounds.Height,
+                               Gdiplus::UnitPixel,
+                               &image_attributes) != Gdiplus::Ok) {
+            return nullptr;
+        }
+
+        HICON icon_handle = nullptr;
+        if (icon_bitmap.GetHICON(&icon_handle) != Gdiplus::Ok) {
+            return nullptr;
+        }
+
+        return icon_handle;
+    }
+
+    HICON LoadTrayIcon() {
+        HICON icon_handle = CreateIconFromLogo();
+        if (icon_handle != nullptr) {
+            return icon_handle;
+        }
+
+        HICON fallback_icon = LoadIconW(nullptr, IDI_APPLICATION);
+        return fallback_icon != nullptr ? CopyIcon(fallback_icon) : nullptr;
+    }
+
     static MonitorApp* FromWindow(HWND window_handle) {
         return reinterpret_cast<MonitorApp*>(GetWindowLongPtrW(window_handle, GWLP_USERDATA));
     }
@@ -871,6 +1129,8 @@ private:
     bool is_shutting_down_{false};
     bool tray_icon_added_{false};
     HICON tray_icon_handle_{nullptr};
+    ULONG_PTR gdiplus_token_{0};
+    bool gdiplus_started_{false};
     AppConfig app_config_{};
     MetricsSnapshot last_snapshot_{};
     std::wstring line1_text_{L"CPU 0%  MEM 0%"};

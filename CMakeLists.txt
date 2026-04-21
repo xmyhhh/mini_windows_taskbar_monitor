@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(minimal_taskbar_monitor LANGUAGES CXX)
 
 add_executable(minimal_taskbar_monitor WIN32
+    app.rc
     src/main.cpp
     src/app_config.cpp
     src/system_metrics.cpp
@@ -26,4 +27,6 @@ target_link_libraries(minimal_taskbar_monitor PRIVATE
     iphlpapi
     shell32
     advapi32
+    gdiplus
+    ole32
 )
