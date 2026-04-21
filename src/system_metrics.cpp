@@ -280,13 +280,13 @@ DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot) {
     wchar_t line2_buffer[160]{};
     if (snapshot.gpu_percent >= 0) {
         swprintf_s(line2_buffer,
-                   L"UP %ls  DN %ls  GPU %d%%",
+                   L"\u2191 %ls  \u2193 %ls  GPU %d%%",
                    up_text.c_str(),
                    down_text.c_str(),
                    snapshot.gpu_percent);
     } else {
         swprintf_s(line2_buffer,
-                   L"UP %ls  DN %ls  GPU --",
+                   L"\u2191 %ls  \u2193 %ls  GPU --",
                    up_text.c_str(),
                    down_text.c_str());
     }
@@ -296,7 +296,7 @@ DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot) {
 }
 
 DisplayLines GetMetricsSampleLines() {
-    return {L"CPU 100%  MEM 100%", L"UP 99.9GB/s  DN 99.9GB/s  GPU 100%"};
+    return {L"CPU 100%  MEM 100%", L"\u2191 99.9GB/s  \u2193 99.9GB/s  GPU 100%"};
 }
 
 bool IsLightTaskbarTheme() {
