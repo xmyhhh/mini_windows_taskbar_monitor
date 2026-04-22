@@ -36,4 +36,3 @@ cmake --build build --config Release
 
 ## Screenshot
 ![screenshot](screenshot1.png)
-

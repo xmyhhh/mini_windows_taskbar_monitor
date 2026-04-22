@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cwctype>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -45,6 +47,8 @@ constexpr UINT kMetricDiskReadCommandId = 1106;
 constexpr UINT kMetricDiskWriteCommandId = 1107;
 constexpr wchar_t kRunRegistryPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValueName[] = L"MinimalTaskbarMonitor";
+constexpr int kHoverPopupMaxVisibleRows = 14;
+constexpr int kHoverPopupWheelRows = 3;
 
 struct WidgetPalette {
     COLORREF background;
@@ -59,9 +63,15 @@ struct HoverPopupPalette {
     COLORREF title_text;
     COLORREF primary_text;
     COLORREF secondary_text;
+    COLORREF warning_text;
+    COLORREF danger_text;
     COLORREF accent;
     COLORREF header_fill;
     COLORREF row_highlight;
+    COLORREF search_fill;
+    COLORREF search_border;
+    COLORREF search_active_border;
+    COLORREF search_placeholder;
 };
 
 enum class HoverPopupSortMode {
@@ -75,7 +85,9 @@ enum class HoverPopupSortMode {
 };
 
 struct HoverPopupTableLayout {
+    RECT search_rect{};
     RECT header_rect{};
+    RECT list_rect{};
     RECT rank_rect{};
     RECT name_rect{};
     RECT cpu_rect{};
@@ -111,9 +123,14 @@ HoverPopupPalette GetHoverPopupPalette(bool light_theme) {
                 RGB(17, 23, 31),
                 RGB(36, 43, 51),
                 RGB(102, 110, 120),
+                RGB(182, 118, 0),
+                RGB(196, 64, 52),
                 RGB(55, 118, 206),
                 RGB(240, 244, 249),
-                RGB(245, 248, 252)};
+                RGB(247, 249, 252),
+                RGB(214, 220, 228),
+                RGB(55, 118, 206),
+                RGB(132, 140, 150)};
     }
 
     return {RGB(28, 31, 36),
@@ -121,10 +138,21 @@ HoverPopupPalette GetHoverPopupPalette(bool light_theme) {
             RGB(246, 248, 250),
             RGB(223, 228, 233),
             RGB(152, 160, 171),
+            RGB(255, 188, 84),
+            RGB(255, 120, 120),
             RGB(126, 182, 255),
             RGB(38, 43, 50),
-            RGB(34, 39, 45)};
+            RGB(33, 37, 43),
+            RGB(72, 79, 89),
+            RGB(126, 182, 255),
+            RGB(131, 139, 149)};
 }
+
+enum class HoverAlertLevel {
+    kNone,
+    kWarning,
+    kDanger
+};
 
 SIZE MeasureText(HDC dc, const std::wstring& text) {
     SIZE text_size{};
@@ -200,6 +228,47 @@ std::wstring FormatPercentValue(double percent) {
     wchar_t buffer[32]{};
     swprintf_s(buffer, L"%.0f%%", std::max(percent, 0.0));
     return buffer;
+}
+
+std::wstring ToLowerCopy(const std::wstring& text) {
+    std::wstring lower = text;
+    std::transform(lower.begin(),
+                   lower.end(),
+                   lower.begin(),
+                   [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+    return lower;
+}
+
+bool ContainsCaseInsensitive(const std::wstring& haystack, const std::wstring& needle) {
+    if (needle.empty()) {
+        return true;
+    }
+
+    return ToLowerCopy(haystack).find(ToLowerCopy(needle)) != std::wstring::npos;
+}
+
+HoverAlertLevel GetUsageAlertLevel(double value, double warning_threshold, double danger_threshold) {
+    if (value >= danger_threshold) {
+        return HoverAlertLevel::kDanger;
+    }
+    if (value >= warning_threshold) {
+        return HoverAlertLevel::kWarning;
+    }
+    return HoverAlertLevel::kNone;
+}
+
+COLORREF ResolveAlertColor(const HoverPopupPalette& palette,
+                           HoverAlertLevel level,
+                           COLORREF default_color) {
+    switch (level) {
+    case HoverAlertLevel::kDanger:
+        return palette.danger_text;
+    case HoverAlertLevel::kWarning:
+        return palette.warning_text;
+    case HoverAlertLevel::kNone:
+    default:
+        return default_color;
+    }
 }
 
 std::wstring FormatUptime(ULONGLONG uptime_ms) {
@@ -570,10 +639,10 @@ private:
         }
 
         hover_popup_window_ =
-            CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                             kHoverPopupClassName,
                             L"Minimal Taskbar Monitor Popup",
-                            WS_POPUP,
+                            WS_POPUP | WS_VSCROLL,
                             0,
                             0,
                             0,
@@ -851,24 +920,105 @@ private:
         SelectObject(dc, old_font);
     }
 
+    int GetHoverPopupRowHeight() const {
+        return popup_text_line_height_ + ScaleByDpi(current_dpi_, 8);
+    }
+
+    int GetHoverPopupSearchHeight() const {
+        return popup_text_line_height_ + ScaleByDpi(current_dpi_, 10);
+    }
+
+    int GetHoverPopupVisibleRowCount() const {
+        return std::max(1,
+                        std::min(kHoverPopupMaxVisibleRows,
+                                 static_cast<int>(hover_popup_snapshot_.top_processes.size())));
+    }
+
+    int GetHoverPopupMaxScrollOffset() const {
+        return std::max(0,
+                        static_cast<int>(hover_popup_snapshot_.top_processes.size()) -
+                            GetHoverPopupVisibleRowCount());
+    }
+
+    void ClampHoverPopupScrollOffset() {
+        hover_popup_scroll_offset_ =
+            std::clamp(hover_popup_scroll_offset_, 0, GetHoverPopupMaxScrollOffset());
+    }
+
+    void UpdateHoverPopupScrollBar() {
+        if (hover_popup_window_ == nullptr || !IsWindow(hover_popup_window_)) {
+            return;
+        }
+
+        ClampHoverPopupScrollOffset();
+        SCROLLINFO scroll_info{};
+        scroll_info.cbSize = sizeof(scroll_info);
+        scroll_info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        scroll_info.nMin = 0;
+        scroll_info.nMax =
+            std::max(0, static_cast<int>(hover_popup_snapshot_.top_processes.size()) - 1);
+        scroll_info.nPage = static_cast<UINT>(GetHoverPopupVisibleRowCount());
+        scroll_info.nPos = hover_popup_scroll_offset_;
+        SetScrollInfo(hover_popup_window_, SB_VERT, &scroll_info, TRUE);
+        ShowScrollBar(hover_popup_window_,
+                      SB_VERT,
+                      hover_popup_snapshot_.top_processes.size() >
+                          static_cast<size_t>(GetHoverPopupVisibleRowCount()));
+    }
+
+    void SetHoverPopupScrollOffset(int offset) {
+        hover_popup_scroll_offset_ = offset;
+        ClampHoverPopupScrollOffset();
+        UpdateHoverPopupScrollBar();
+        RequestHoverPopupRedraw();
+    }
+
+    void ScrollHoverPopupBy(int delta_rows) {
+        if (delta_rows == 0) {
+            return;
+        }
+        SetHoverPopupScrollOffset(hover_popup_scroll_offset_ + delta_rows);
+    }
+
+    void RefreshHoverPopupView(bool reposition = true) {
+        ApplyHoverPopupSort();
+        UpdateHoverPopupSize();
+        UpdateHoverPopupScrollBar();
+        if (reposition) {
+            PositionHoverPopup();
+        }
+        RequestHoverPopupRedraw();
+    }
+
     HoverPopupTableLayout ComputeHoverPopupTableLayout(const RECT& client_rect) const {
         const int padding_left = ScaleByDpi(current_dpi_, 16);
         const int padding_right = ScaleByDpi(current_dpi_, 30);
         const int gap = ScaleByDpi(current_dpi_, 8);
         const int line_gap = ScaleByDpi(current_dpi_, 4);
         const int inner_padding = ScaleByDpi(current_dpi_, 6);
+        const int row_gap = ScaleByDpi(current_dpi_, 6);
+        const int scroll_bar_width = GetSystemMetrics(SM_CXVSCROLL);
         const int content_left = client_rect.left + padding_left;
-        const int content_right = client_rect.right - padding_right;
+        const int content_right = client_rect.right - padding_right - scroll_bar_width;
         const int content_top =
             client_rect.top + padding_left + popup_title_line_height_ + gap;
-        const int table_top =
-            content_top + popup_text_line_height_ * 3 + line_gap * 2 + gap;
+        const int summary_bottom = content_top + popup_text_line_height_ * 3 + line_gap * 2;
+        const int search_height = GetHoverPopupSearchHeight();
+        const int row_height = GetHoverPopupRowHeight();
+        const int visible_rows = GetHoverPopupVisibleRowCount();
+        const int search_top = summary_bottom + gap;
 
         HoverPopupTableLayout layout{};
+        layout.search_rect = {content_left, search_top, content_right, search_top + search_height};
+        const int table_top = layout.search_rect.bottom + gap;
         layout.header_rect = {content_left,
                               table_top,
                               content_right,
                               table_top + popup_text_line_height_ + ScaleByDpi(current_dpi_, 8)};
+        layout.list_rect = {content_left,
+                            layout.header_rect.bottom + row_gap,
+                            content_right,
+                            layout.header_rect.bottom + row_gap + visible_rows * row_height};
 
         const int rank_width = ScaleByDpi(current_dpi_, 24);
         const int cpu_width = ScaleByDpi(current_dpi_, 56);
@@ -914,28 +1064,45 @@ private:
     }
 
     std::wstring GetHoverPopupSubtitle() const {
+        const size_t visible_count = hover_popup_snapshot_.top_processes.size();
+        const int total_count = hover_popup_base_snapshot_.total_process_count;
+        const std::wstring count_suffix =
+            hover_popup_search_text_.empty()
+                ? (total_count > 0 ? L"  (" + std::to_wstring(total_count) + L" shown)" : L"")
+                : (L"  (" + std::to_wstring(visible_count) + L"/" +
+                   std::to_wstring(std::max(total_count, 0)) + L")");
         switch (hover_popup_sort_mode_) {
         case HoverPopupSortMode::kCpu:
-            return L"Top 10 processes sorted by CPU";
+            return std::wstring(L"Processes sorted by CPU") + count_suffix;
         case HoverPopupSortMode::kMemory:
-            return L"Top 10 processes sorted by memory (USS -> RSS -> VMS)";
+            return std::wstring(L"Processes sorted by memory (USS -> RSS -> VMS)") + count_suffix;
         case HoverPopupSortMode::kGpu:
-            return L"Top 10 processes sorted by GPU";
+            return std::wstring(L"Processes sorted by GPU") + count_suffix;
         case HoverPopupSortMode::kVram:
-            return L"Top 10 processes sorted by VRAM";
+            return std::wstring(L"Processes sorted by VRAM") + count_suffix;
         case HoverPopupSortMode::kIo:
-            return L"Top 10 processes sorted by IO";
+            return std::wstring(L"Processes sorted by IO") + count_suffix;
         case HoverPopupSortMode::kNetwork:
-            return L"Top 10 processes sorted by network";
+            return std::wstring(L"Processes sorted by network") + count_suffix;
         case HoverPopupSortMode::kDefault:
         default:
-            return L"Top 10 processes by blended pressure score";
+            return std::wstring(L"Processes by blended pressure score") + count_suffix;
         }
     }
 
     void ApplyHoverPopupSort() {
         hover_popup_snapshot_ = hover_popup_base_snapshot_;
+        if (!hover_popup_search_text_.empty()) {
+            const std::wstring needle = ToLowerCopy(hover_popup_search_text_);
+            std::erase_if(hover_popup_snapshot_.top_processes,
+                          [&needle](const ProcessPopupItem& item) {
+                              return !ContainsCaseInsensitive(item.name, needle) &&
+                                     std::to_wstring(item.pid).find(needle) == std::wstring::npos;
+                          });
+        }
+
         if (hover_popup_sort_mode_ == HoverPopupSortMode::kDefault) {
+            ClampHoverPopupScrollOffset();
             return;
         }
 
@@ -1064,6 +1231,8 @@ private:
         default:
             break;
         }
+
+        ClampHoverPopupScrollOffset();
     }
 
     HoverPopupSortMode HitTestHoverPopupSortMode(const POINT& client_point) const {
@@ -1095,6 +1264,103 @@ private:
         return HoverPopupSortMode::kDefault;
     }
 
+    bool IsHoverPopupSearchHit(const POINT& client_point) const {
+        if (hover_popup_window_ == nullptr || !IsWindow(hover_popup_window_)) {
+            return false;
+        }
+
+        RECT client_rect{};
+        GetClientRect(hover_popup_window_, &client_rect);
+        const HoverPopupTableLayout layout = ComputeHoverPopupTableLayout(client_rect);
+        return PtInRect(&layout.search_rect, client_point) != FALSE;
+    }
+
+    void SetHoverPopupSearchActive(bool active) {
+        if (hover_popup_search_active_ == active) {
+            return;
+        }
+
+        hover_popup_search_active_ = active;
+        RequestHoverPopupRedraw();
+    }
+
+    void SetHoverPopupSearchText(const std::wstring& text) {
+        if (hover_popup_search_text_ == text) {
+            return;
+        }
+
+        hover_popup_search_text_ = text;
+        hover_popup_scroll_offset_ = 0;
+        RefreshHoverPopupView();
+    }
+
+    void AppendHoverPopupSearchCharacter(wchar_t ch) {
+        if (hover_popup_search_text_.size() >= 64) {
+            return;
+        }
+
+        std::wstring updated_text = hover_popup_search_text_;
+        updated_text.push_back(ch);
+        SetHoverPopupSearchText(updated_text);
+    }
+
+    void RemoveHoverPopupSearchCharacter() {
+        if (hover_popup_search_text_.empty()) {
+            return;
+        }
+
+        std::wstring updated_text = hover_popup_search_text_;
+        updated_text.pop_back();
+        SetHoverPopupSearchText(updated_text);
+    }
+
+    bool HandleHoverPopupSearchKeyDown(WPARAM key) {
+        switch (key) {
+        case VK_UP:
+            ScrollHoverPopupBy(-1);
+            return true;
+        case VK_DOWN:
+            ScrollHoverPopupBy(1);
+            return true;
+        case VK_PRIOR:
+            ScrollHoverPopupBy(-GetHoverPopupVisibleRowCount());
+            return true;
+        case VK_NEXT:
+            ScrollHoverPopupBy(GetHoverPopupVisibleRowCount());
+            return true;
+        case VK_HOME:
+            SetHoverPopupScrollOffset(0);
+            return true;
+        case VK_END:
+            SetHoverPopupScrollOffset(GetHoverPopupMaxScrollOffset());
+            return true;
+        case VK_ESCAPE:
+            if (!hover_popup_search_text_.empty()) {
+                SetHoverPopupSearchText(L"");
+            } else {
+                SetHoverPopupSearchActive(false);
+            }
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool HandleHoverPopupSearchChar(WPARAM key) {
+        if (key == VK_BACK) {
+            RemoveHoverPopupSearchCharacter();
+            return true;
+        }
+
+        if (key < 32 || key == 127) {
+            return false;
+        }
+
+        SetHoverPopupSearchActive(true);
+        AppendHoverPopupSearchCharacter(static_cast<wchar_t>(key));
+        return true;
+    }
+
     void ToggleHoverPopupSort(HoverPopupSortMode mode) {
         if (mode == HoverPopupSortMode::kDefault) {
             return;
@@ -1102,14 +1368,55 @@ private:
 
         hover_popup_sort_mode_ =
             (hover_popup_sort_mode_ == mode) ? HoverPopupSortMode::kDefault : mode;
-        ApplyHoverPopupSort();
-        UpdateHoverPopupSize();
-        PositionHoverPopup();
-        RequestHoverPopupRedraw();
+        hover_popup_scroll_offset_ = 0;
+        RefreshHoverPopupView();
     }
 
     void HandleHoverPopupClick(const POINT& client_point) {
+        SetFocus(hover_popup_window_);
+        if (IsHoverPopupSearchHit(client_point)) {
+            SetHoverPopupSearchActive(true);
+            return;
+        }
+
+        SetHoverPopupSearchActive(false);
         ToggleHoverPopupSort(HitTestHoverPopupSortMode(client_point));
+    }
+
+    void HandleHoverPopupVScroll(WPARAM scroll_code, int thumb_position) {
+        switch (scroll_code) {
+        case SB_LINEUP:
+            ScrollHoverPopupBy(-1);
+            break;
+        case SB_LINEDOWN:
+            ScrollHoverPopupBy(1);
+            break;
+        case SB_PAGEUP:
+            ScrollHoverPopupBy(-GetHoverPopupVisibleRowCount());
+            break;
+        case SB_PAGEDOWN:
+            ScrollHoverPopupBy(GetHoverPopupVisibleRowCount());
+            break;
+        case SB_TOP:
+            SetHoverPopupScrollOffset(0);
+            break;
+        case SB_BOTTOM:
+            SetHoverPopupScrollOffset(GetHoverPopupMaxScrollOffset());
+            break;
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK:
+            SetHoverPopupScrollOffset(thumb_position);
+            break;
+        default:
+            break;
+        }
+    }
+
+    void HandleHoverPopupMouseWheel(short delta) {
+        const int notches = static_cast<int>(delta / WHEEL_DELTA);
+        if (notches != 0) {
+            ScrollHoverPopupBy(-notches * kHoverPopupWheelRows);
+        }
     }
 
     void UpdateHoverPopupSize() {
@@ -1117,17 +1424,19 @@ private:
         const int title_gap = ScaleByDpi(current_dpi_, 8);
         const int summary_gap = ScaleByDpi(current_dpi_, 4);
         const int section_gap = ScaleByDpi(current_dpi_, 10);
+        const int search_height = GetHoverPopupSearchHeight();
         const int header_height = popup_text_line_height_ + ScaleByDpi(current_dpi_, 8);
-        const int row_height = popup_text_line_height_ + ScaleByDpi(current_dpi_, 8);
+        const int row_gap = ScaleByDpi(current_dpi_, 6);
+        const int row_height = GetHoverPopupRowHeight();
         const int footer_height =
             popup_text_line_height_ * 2 + ScaleByDpi(current_dpi_, 10);
-        const int row_count =
-            std::max<int>(1, static_cast<int>(hover_popup_snapshot_.top_processes.size()));
+        const int row_count = GetHoverPopupVisibleRowCount();
 
         hover_popup_size_.cx = ScaleByDpi(current_dpi_, 980);
         hover_popup_size_.cy = padding + popup_title_line_height_ + title_gap +
                                (popup_text_line_height_ + summary_gap) * 3 + section_gap +
-                               header_height + row_count * row_height + footer_height + padding;
+                               search_height + section_gap + header_height + row_gap +
+                               row_count * row_height + section_gap + footer_height + padding;
     }
 
     void DrawHoverPopupContents(HDC dc, const RECT& client_rect) {
@@ -1153,8 +1462,9 @@ private:
         const int gap = ScaleByDpi(current_dpi_, 8);
         const int line_gap = ScaleByDpi(current_dpi_, 4);
         const int row_gap = ScaleByDpi(current_dpi_, 6);
+        const int scroll_bar_width = GetSystemMetrics(SM_CXVSCROLL);
         const int content_left = client_rect.left + padding_left;
-        const int content_right = client_rect.right - padding_right;
+        const int content_right = client_rect.right - padding_right - scroll_bar_width;
 
         SetBkMode(dc, TRANSPARENT);
 
@@ -1193,14 +1503,54 @@ private:
         RECT line_rect{content_left, content_top, content_right,
                        content_top + popup_text_line_height_};
 
+        auto draw_inline_segment = [&](RECT& rect, const std::wstring& text, COLORREF color) {
+            if (text.empty()) {
+                return;
+            }
+            SetTextColor(dc, color);
+            RECT draw_rect = rect;
+            DrawTextW(dc,
+                      text.c_str(),
+                      -1,
+                      &draw_rect,
+                      DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+            rect.left += MeasureText(dc, text).cx;
+        };
+
+        RECT summary_line1_rect = line_rect;
+        const int total_process_count =
+            std::max(hover_popup_base_snapshot_.total_process_count,
+                     hover_popup_snapshot_.total_process_count);
+        const std::wstring proc_summary =
+            hover_popup_search_text_.empty()
+                ? std::to_wstring(std::max(total_process_count, 0))
+                : (std::to_wstring(hover_popup_snapshot_.top_processes.size()) + L"/" +
+                   std::to_wstring(std::max(total_process_count, 0)));
         const std::wstring gpu_summary =
-            last_snapshot_.gpu_percent >= 0 ? std::to_wstring(last_snapshot_.gpu_percent) + L"%"
-                                            : L"--";
-        const std::wstring summary_line1 =
-            L"CPU " + std::to_wstring(std::max(last_snapshot_.cpu_percent, 0)) + L"%   MEM " +
-            std::to_wstring(std::max(last_snapshot_.memory_percent, 0)) + L"%   GPU " +
-            gpu_summary + L"   PROC " +
-            std::to_wstring(std::max(hover_popup_snapshot_.total_process_count, 0));
+            last_snapshot_.gpu_percent >= 0 ? FormatPercentValue(last_snapshot_.gpu_percent) : L"--";
+        draw_inline_segment(summary_line1_rect, L"CPU ", palette.primary_text);
+        draw_inline_segment(summary_line1_rect,
+                            FormatPercentValue(std::max(last_snapshot_.cpu_percent, 0)),
+                            ResolveAlertColor(palette,
+                                              GetUsageAlertLevel(last_snapshot_.cpu_percent, 80.0, 95.0),
+                                              palette.primary_text));
+        draw_inline_segment(summary_line1_rect, L"   MEM ", palette.primary_text);
+        draw_inline_segment(summary_line1_rect,
+                            FormatPercentValue(std::max(last_snapshot_.memory_percent, 0)),
+                            ResolveAlertColor(palette,
+                                              GetUsageAlertLevel(last_snapshot_.memory_percent,
+                                                                 85.0,
+                                                                 95.0),
+                                              palette.primary_text));
+        draw_inline_segment(summary_line1_rect, L"   GPU ", palette.primary_text);
+        draw_inline_segment(summary_line1_rect,
+                            gpu_summary,
+                            ResolveAlertColor(palette,
+                                              GetUsageAlertLevel(last_snapshot_.gpu_percent, 90.0, 98.0),
+                                              palette.primary_text));
+        draw_inline_segment(summary_line1_rect, L"   PROC ", palette.primary_text);
+        draw_inline_segment(summary_line1_rect, proc_summary, palette.secondary_text);
+
         const std::wstring summary_line2 =
             L"NET \u2191 " + FormatRate(last_snapshot_.upload_bytes_per_second) + L"   \u2193 " +
             FormatRate(last_snapshot_.download_bytes_per_second) + L"   DISK R " +
@@ -1210,13 +1560,8 @@ private:
             L"Uptime " + FormatUptime(hover_popup_snapshot_.uptime_ms) +
             L"   MEM = RSS / USS / VMS(commit)   VRAM = dedicated GPU memory";
 
-        SetTextColor(dc, palette.primary_text);
-        DrawTextW(dc,
-                  summary_line1.c_str(),
-                  -1,
-                  &line_rect,
-                  DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
         OffsetRect(&line_rect, 0, popup_text_line_height_ + line_gap);
+        SetTextColor(dc, palette.primary_text);
         DrawTextW(dc,
                   summary_line2.c_str(),
                   -1,
@@ -1231,6 +1576,38 @@ private:
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
 
         const HoverPopupTableLayout table_layout = ComputeHoverPopupTableLayout(client_rect);
+        HBRUSH search_fill_brush = CreateSolidBrush(palette.search_fill);
+        FillRect(dc, &table_layout.search_rect, search_fill_brush);
+        DeleteObject(search_fill_brush);
+
+        HBRUSH search_border_brush = CreateSolidBrush(hover_popup_search_active_
+                                                          ? palette.search_active_border
+                                                          : palette.search_border);
+        FrameRect(dc, &table_layout.search_rect, search_border_brush);
+        DeleteObject(search_border_brush);
+
+        RECT search_text_rect = table_layout.search_rect;
+        InflateRect(&search_text_rect, -ScaleByDpi(current_dpi_, 8), 0);
+        std::wstring search_text;
+        COLORREF search_text_color = palette.primary_text;
+        if (!hover_popup_search_text_.empty()) {
+            search_text = hover_popup_search_text_;
+            if (hover_popup_search_active_) {
+                search_text += L" |";
+            }
+        } else if (hover_popup_search_active_) {
+            search_text = L"|";
+        } else {
+            search_text = L"Search processes...  (type to filter)";
+            search_text_color = palette.search_placeholder;
+        }
+        SetTextColor(dc, search_text_color);
+        DrawTextW(dc,
+                  search_text.c_str(),
+                  -1,
+                  &search_text_rect,
+                  DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+
         const RECT& header_rect = table_layout.header_rect;
         HBRUSH header_brush = CreateSolidBrush(palette.header_fill);
         FillRect(dc, &header_rect, header_brush);
@@ -1280,8 +1657,15 @@ private:
                     DT_RIGHT,
                     HoverPopupSortMode::kNetwork);
 
-        const int row_height = popup_text_line_height_ + ScaleByDpi(current_dpi_, 8);
-        int row_top = header_rect.bottom + row_gap;
+        const int row_height = GetHoverPopupRowHeight();
+        int row_top = table_layout.list_rect.top;
+        const int start_index =
+            std::min<int>(hover_popup_scroll_offset_,
+                          std::max<int>(0,
+                                        static_cast<int>(hover_popup_snapshot_.top_processes.size()) - 1));
+        const int end_index =
+            std::min<int>(start_index + GetHoverPopupVisibleRowCount(),
+                          static_cast<int>(hover_popup_snapshot_.top_processes.size()));
         if (hover_popup_snapshot_.top_processes.empty()) {
             RECT empty_rect{content_left,
                             row_top,
@@ -1289,12 +1673,14 @@ private:
                             row_top + row_height};
             SetTextColor(dc, palette.secondary_text);
             DrawTextW(dc,
-                      L"Process data is warming up. Keep the popup open for a second.",
+                      hover_popup_base_snapshot_.total_process_count > 0
+                          ? L"No matching processes. Press Esc to clear search."
+                          : L"Process data is warming up. Keep the popup open for a second.",
                       -1,
                       &empty_rect,
                       DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         } else {
-            for (size_t index = 0; index < hover_popup_snapshot_.top_processes.size(); ++index) {
+            for (int index = start_index; index < end_index; ++index) {
                 const ProcessPopupItem& item = hover_popup_snapshot_.top_processes[index];
                 RECT row_rect{content_left, row_top, content_right,
                               row_top + row_height};
@@ -1358,6 +1744,16 @@ private:
                 const std::wstring net_text = hover_popup_snapshot_.network_metric_available
                                                   ? FormatRate(item.network_bytes_per_second)
                                                   : L"--";
+                const COLORREF cpu_color =
+                    ResolveAlertColor(palette,
+                                      GetUsageAlertLevel(item.cpu_percent, 80.0, 95.0),
+                                      palette.primary_text);
+                const COLORREF gpu_color =
+                    last_snapshot_.gpu_percent >= 0
+                        ? ResolveAlertColor(palette,
+                                            GetUsageAlertLevel(item.gpu_percent, 90.0, 98.0),
+                                            palette.primary_text)
+                        : palette.secondary_text;
 
                 SetTextColor(dc, palette.secondary_text);
                 DrawTextW(dc,
@@ -1371,21 +1767,25 @@ private:
                           -1,
                           &current_name_rect,
                           DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                SetTextColor(dc, cpu_color);
                 DrawTextW(dc,
                           cpu_text.c_str(),
                           -1,
                           &current_cpu_rect,
                           DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                SetTextColor(dc, palette.primary_text);
                 DrawTextW(dc,
                           mem_text.c_str(),
                           -1,
                           &current_mem_rect,
                           DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                SetTextColor(dc, gpu_color);
                 DrawTextW(dc,
                           gpu_text.c_str(),
                           -1,
                           &current_gpu_rect,
                           DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                SetTextColor(dc, palette.primary_text);
                 DrawTextW(dc,
                           vram_text.c_str(),
                           -1,
@@ -1407,13 +1807,13 @@ private:
         }
 
         RECT footer_rect1{content_left,
-                          client_rect.bottom - padding_left - popup_text_line_height_ * 2 - line_gap,
+                          table_layout.list_rect.bottom + gap,
                           content_right,
-                          client_rect.bottom - padding_left - popup_text_line_height_ - line_gap};
+                          table_layout.list_rect.bottom + gap + popup_text_line_height_};
         RECT footer_rect2{content_left,
-                          client_rect.bottom - padding_left - popup_text_line_height_,
+                          footer_rect1.bottom + line_gap,
                           content_right,
-                          client_rect.bottom - padding_left};
+                          footer_rect1.bottom + line_gap + popup_text_line_height_};
         SetTextColor(dc, palette.secondary_text);
         DrawTextW(dc,
                   L"* MEM shows RSS / USS / VMS(commit, psutil/taskmgr-style). PSS is not exposed directly yet.",
@@ -1455,9 +1855,10 @@ private:
     }
 
     void RefreshHoverPopupData() {
-        hover_popup_base_snapshot_ = process_monitor_.Sample(last_snapshot_);
+        hover_popup_base_snapshot_ = process_monitor_.Sample(last_snapshot_, 0);
         ApplyHoverPopupSort();
         UpdateHoverPopupSize();
+        UpdateHoverPopupScrollBar();
     }
 
     void PositionHoverPopup() {
@@ -1536,12 +1937,14 @@ private:
         PositionHoverPopup();
         ShowWindow(hover_popup_window_, SW_SHOWNOACTIVATE);
         hover_popup_visible_ = true;
+        UpdateHoverPopupScrollBar();
         RequestHoverPopupRedraw();
     }
 
     void HideHoverPopup() {
         KillTimer(controller_window_, kHoverHideTimerId);
         hover_popup_visible_ = false;
+        hover_popup_search_active_ = false;
         if (hover_popup_window_ != nullptr && IsWindow(hover_popup_window_)) {
             ShowWindow(hover_popup_window_, SW_HIDE);
         }
@@ -2173,16 +2576,36 @@ private:
 
         switch (message) {
         case WM_MOUSEACTIVATE:
-            return MA_NOACTIVATE;
+            return MA_ACTIVATE;
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT:
             app->PaintHoverPopup();
             return 0;
+        case WM_VSCROLL:
+            app->HandleHoverPopupVScroll(LOWORD(w_param), HIWORD(w_param));
+            return 0;
+        case WM_MOUSEWHEEL:
+            app->HandleHoverPopupMouseWheel(GET_WHEEL_DELTA_WPARAM(w_param));
+            return 0;
         case WM_MOUSEMOVE:
             app->HandleHoverMove(window_handle);
             return 0;
         case WM_MOUSELEAVE:
+            app->ArmHoverHideTimer();
+            return 0;
+        case WM_KEYDOWN:
+            if (app->HandleHoverPopupSearchKeyDown(w_param)) {
+                return 0;
+            }
+            break;
+        case WM_CHAR:
+            if (app->HandleHoverPopupSearchChar(w_param)) {
+                return 0;
+            }
+            break;
+        case WM_KILLFOCUS:
+            app->SetHoverPopupSearchActive(false);
             app->ArmHoverHideTimer();
             return 0;
         case WM_LBUTTONUP: {
@@ -2238,6 +2661,7 @@ private:
     bool has_second_line_{true};
     bool is_shutting_down_{false};
     bool hover_popup_visible_{false};
+    bool hover_popup_search_active_{false};
     bool tray_icon_added_{false};
     HICON tray_icon_handle_{nullptr};
     ULONG_PTR gdiplus_token_{0};
@@ -2247,6 +2671,8 @@ private:
     ProcessPopupSnapshot hover_popup_base_snapshot_{};
     ProcessPopupSnapshot hover_popup_snapshot_{};
     HoverPopupSortMode hover_popup_sort_mode_{HoverPopupSortMode::kDefault};
+    int hover_popup_scroll_offset_{0};
+    std::wstring hover_popup_search_text_{};
     std::wstring line1_text_{L"CPU 0%  MEM 0%"};
     std::wstring line2_text_{L"\u2191 0B/s  \u2193 0B/s  R 0B/s  W 0B/s"};
     std::vector<DisplayLines::Column> display_columns_{};

@@ -871,7 +871,7 @@ ProcessPopupSnapshot ProcessMonitor::Sample(const MetricsSnapshot& system_snapsh
         return left.pid < right.pid;
     });
 
-    if (samples.size() > max_count) {
+    if (max_count != 0 && samples.size() > max_count) {
         samples.resize(max_count);
     }
 
