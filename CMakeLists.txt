@@ -37,6 +37,7 @@ add_executable(minimal_taskbar_monitor WIN32
     "${CMAKE_CURRENT_BINARY_DIR}/app_generated.rc"
     src/main.cpp
     src/app_config.cpp
+    src/process_monitor.cpp
     src/system_metrics.cpp
     src/taskbar_embedder.cpp
 )
@@ -58,6 +59,7 @@ target_compile_definitions(minimal_taskbar_monitor PRIVATE
 target_link_libraries(minimal_taskbar_monitor PRIVATE
     pdh
     iphlpapi
+    psapi
     shell32
     advapi32
     gdiplus

@@ -1,4 +1,5 @@
 #include "app_config.h"
+#include "process_monitor.h"
 #include "resource.h"
 #include "system_metrics.h"
 #include "taskbar_embedder.h"
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace minimal_taskbar_monitor {
 
@@ -21,12 +23,15 @@ namespace {
 
 constexpr wchar_t kControllerClassName[] = L"MinimalTaskbarMonitorControllerWindow";
 constexpr wchar_t kWidgetClassName[] = L"MinimalTaskbarMonitorWidgetWindow";
+constexpr wchar_t kHoverPopupClassName[] = L"MinimalTaskbarMonitorHoverPopupWindow";
 constexpr UINT_PTR kSampleTimerId = 1;
 constexpr UINT_PTR kLayoutTimerId = 2;
 constexpr UINT_PTR kReattachTimerId = 3;
+constexpr UINT_PTR kHoverHideTimerId = 4;
 constexpr UINT kSampleIntervalMs = 1000;
 constexpr UINT kLayoutIntervalMs = 1000;
 constexpr UINT kReattachDelayMs = 600;
+constexpr UINT kHoverHideDelayMs = 180;
 constexpr UINT kTrayIconCallbackMessage = WM_APP + 1;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kExitCommandId = 1001;
@@ -48,6 +53,39 @@ struct WidgetPalette {
     COLORREF secondary_text;
 };
 
+struct HoverPopupPalette {
+    COLORREF background;
+    COLORREF border;
+    COLORREF title_text;
+    COLORREF primary_text;
+    COLORREF secondary_text;
+    COLORREF accent;
+    COLORREF header_fill;
+    COLORREF row_highlight;
+};
+
+enum class HoverPopupSortMode {
+    kDefault,
+    kCpu,
+    kMemory,
+    kGpu,
+    kVram,
+    kIo,
+    kNetwork
+};
+
+struct HoverPopupTableLayout {
+    RECT header_rect{};
+    RECT rank_rect{};
+    RECT name_rect{};
+    RECT cpu_rect{};
+    RECT mem_rect{};
+    RECT gpu_rect{};
+    RECT vram_rect{};
+    RECT io_rect{};
+    RECT net_rect{};
+};
+
 struct BgraPixel {
     BYTE blue;
     BYTE green;
@@ -64,6 +102,130 @@ WidgetPalette GetWidgetPalette(bool light_theme) {
         return {RGB(244, 246, 248), RGB(211, 216, 222), RGB(24, 28, 32), RGB(84, 91, 99)};
     }
     return {RGB(36, 39, 45), RGB(67, 72, 80), RGB(245, 247, 250), RGB(181, 188, 198)};
+}
+
+HoverPopupPalette GetHoverPopupPalette(bool light_theme) {
+    if (light_theme) {
+        return {RGB(251, 252, 254),
+                RGB(212, 218, 226),
+                RGB(17, 23, 31),
+                RGB(36, 43, 51),
+                RGB(102, 110, 120),
+                RGB(55, 118, 206),
+                RGB(240, 244, 249),
+                RGB(245, 248, 252)};
+    }
+
+    return {RGB(28, 31, 36),
+            RGB(68, 74, 83),
+            RGB(246, 248, 250),
+            RGB(223, 228, 233),
+            RGB(152, 160, 171),
+            RGB(126, 182, 255),
+            RGB(38, 43, 50),
+            RGB(34, 39, 45)};
+}
+
+SIZE MeasureText(HDC dc, const std::wstring& text) {
+    SIZE text_size{};
+    if (!text.empty()) {
+        GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &text_size);
+    }
+    return text_size;
+}
+
+std::vector<int> MeasureColumnWidths(HDC dc, const std::vector<DisplayLines::Column>& columns) {
+    std::vector<int> column_widths;
+    column_widths.reserve(columns.size());
+
+    for (const auto& column : columns) {
+        const SIZE top_size = MeasureText(dc, column.top_text);
+        const SIZE bottom_size = MeasureText(dc, column.bottom_text);
+        column_widths.push_back(std::max(top_size.cx, bottom_size.cx));
+    }
+
+    return column_widths;
+}
+
+int SumColumnWidths(const std::vector<int>& column_widths, int column_gap) {
+    int total_width = 0;
+    for (size_t i = 0; i < column_widths.size(); ++i) {
+        if (i != 0) {
+            total_width += column_gap;
+        }
+        total_width += column_widths[i];
+    }
+    return total_width;
+}
+
+std::wstring FormatRate(unsigned long long bytes_per_second) {
+    double value = static_cast<double>(bytes_per_second);
+    const wchar_t* units[] = {L"B/s", L"KB/s", L"MB/s", L"GB/s"};
+    size_t unit_index = 0;
+
+    while (value >= 1024.0 && unit_index + 1 < _countof(units)) {
+        value /= 1024.0;
+        ++unit_index;
+    }
+
+    wchar_t buffer[64]{};
+    if (value >= 100.0 || unit_index == 0) {
+        swprintf_s(buffer, L"%.0f%ls", value, units[unit_index]);
+    } else {
+        swprintf_s(buffer, L"%.1f%ls", value, units[unit_index]);
+    }
+    return buffer;
+}
+
+std::wstring FormatBytes(unsigned long long byte_count) {
+    double value = static_cast<double>(byte_count);
+    const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
+    size_t unit_index = 0;
+
+    while (value >= 1024.0 && unit_index + 1 < _countof(units)) {
+        value /= 1024.0;
+        ++unit_index;
+    }
+
+    wchar_t buffer[64]{};
+    if (value >= 100.0 || unit_index == 0) {
+        swprintf_s(buffer, L"%.0f%ls", value, units[unit_index]);
+    } else {
+        swprintf_s(buffer, L"%.1f%ls", value, units[unit_index]);
+    }
+    return buffer;
+}
+
+std::wstring FormatPercentValue(double percent) {
+    wchar_t buffer[32]{};
+    swprintf_s(buffer, L"%.0f%%", std::max(percent, 0.0));
+    return buffer;
+}
+
+std::wstring FormatUptime(ULONGLONG uptime_ms) {
+    unsigned long long total_minutes = uptime_ms / 60000ULL;
+    const unsigned long long days = total_minutes / (24ULL * 60ULL);
+    total_minutes %= (24ULL * 60ULL);
+    const unsigned long long hours = total_minutes / 60ULL;
+    const unsigned long long minutes = total_minutes % 60ULL;
+
+    wchar_t buffer[64]{};
+    if (days > 0) {
+        swprintf_s(buffer, L"%llud %02lluh %02llum", days, hours, minutes);
+    } else {
+        swprintf_s(buffer, L"%02lluh %02llum", hours, minutes);
+    }
+    return buffer;
+}
+
+bool IsPointInWindowRect(HWND window_handle, const POINT& screen_point) {
+    if (window_handle == nullptr || !IsWindow(window_handle)) {
+        return false;
+    }
+
+    RECT window_rect{};
+    return GetWindowRect(window_handle, &window_rect) != FALSE &&
+           PtInRect(&window_rect, screen_point) != FALSE;
 }
 
 bool IsNearlyWhite(const Gdiplus::Color& color) {
@@ -101,9 +263,9 @@ bool FindContentBounds(Gdiplus::Bitmap& bitmap, Gdiplus::Rect& bounds) {
     return true;
 }
 
-HFONT CreatePreferredUiFont(UINT dpi) {
+HFONT CreatePreferredUiFont(UINT dpi, int point_size) {
     const LOGFONTW font_template{
-        .lfHeight = -ScaleByDpi(dpi, 12),
+        .lfHeight = -ScaleByDpi(dpi, point_size),
         .lfWidth = 0,
         .lfEscapement = 0,
         .lfOrientation = 0,
@@ -353,6 +515,17 @@ private:
         widget_class.hIcon = app_icon;
         widget_class.hIconSm = app_icon;
         RegisterClassExW(&widget_class);
+
+        WNDCLASSEXW popup_class{};
+        popup_class.cbSize = sizeof(popup_class);
+        popup_class.lpfnWndProc = &MonitorApp::HoverPopupWindowProc;
+        popup_class.hInstance = instance_handle_;
+        popup_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        popup_class.hbrBackground = nullptr;
+        popup_class.lpszClassName = kHoverPopupClassName;
+        popup_class.hIcon = app_icon;
+        popup_class.hIconSm = app_icon;
+        RegisterClassExW(&popup_class);
     }
 
     bool Initialize() {
@@ -361,6 +534,7 @@ private:
         if (!EnsureWidgetWindow()) {
             return false;
         }
+        RefreshFontAndSize();
 
         ReattachWidget();
         EnsureTrayIcon();
@@ -388,6 +562,27 @@ private:
                                          instance_handle_,
                                          this);
         return widget_window_ != nullptr;
+    }
+
+    bool EnsureHoverPopupWindow() {
+        if (hover_popup_window_ != nullptr && IsWindow(hover_popup_window_)) {
+            return true;
+        }
+
+        hover_popup_window_ =
+            CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                            kHoverPopupClassName,
+                            L"Minimal Taskbar Monitor Popup",
+                            WS_POPUP,
+                            0,
+                            0,
+                            0,
+                            0,
+                            nullptr,
+                            nullptr,
+                            instance_handle_,
+                            this);
+        return hover_popup_window_ != nullptr;
     }
 
     bool EnsureTrayIcon() {
@@ -430,6 +625,8 @@ private:
         KillTimer(controller_window_, kSampleTimerId);
         KillTimer(controller_window_, kLayoutTimerId);
         KillTimer(controller_window_, kReattachTimerId);
+        KillTimer(controller_window_, kHoverHideTimerId);
+        HideHoverPopup();
         RemoveTrayIcon();
 
         embedder_.Detach(widget_window_);
@@ -445,14 +642,27 @@ private:
             DeleteObject(font_);
             font_ = nullptr;
         }
+        if (popup_font_ != nullptr) {
+            DeleteObject(popup_font_);
+            popup_font_ = nullptr;
+        }
+        if (popup_title_font_ != nullptr) {
+            DeleteObject(popup_title_font_);
+            popup_title_font_ = nullptr;
+        }
 
         if (widget_window_ != nullptr && IsWindow(widget_window_)) {
             DestroyWindow(widget_window_);
             widget_window_ = nullptr;
         }
+        if (hover_popup_window_ != nullptr && IsWindow(hover_popup_window_)) {
+            DestroyWindow(hover_popup_window_);
+            hover_popup_window_ = nullptr;
+        }
     }
 
     void ReattachWidget() {
+        HideHoverPopup();
         if (!EnsureWidgetWindow()) {
             SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
             return;
@@ -477,53 +687,76 @@ private:
 
     void RefreshFontAndSize() {
         const UINT dpi = embedder_.CurrentDpi();
-        if (dpi != current_dpi_ || font_ == nullptr) {
+        if (dpi != current_dpi_ || font_ == nullptr || popup_font_ == nullptr ||
+            popup_title_font_ == nullptr) {
             current_dpi_ = dpi;
             if (font_ != nullptr) {
                 DeleteObject(font_);
                 font_ = nullptr;
             }
+            if (popup_font_ != nullptr) {
+                DeleteObject(popup_font_);
+                popup_font_ = nullptr;
+            }
+            if (popup_title_font_ != nullptr) {
+                DeleteObject(popup_title_font_);
+                popup_title_font_ = nullptr;
+            }
 
-            font_ = CreatePreferredUiFont(current_dpi_);
+            font_ = CreatePreferredUiFont(current_dpi_, 12);
+            popup_font_ = CreatePreferredUiFont(current_dpi_, 13);
+            popup_title_font_ = CreatePreferredUiFont(current_dpi_, 15);
         }
 
         HDC screen_dc = GetDC(nullptr);
         HFONT active_font =
             font_ != nullptr ? font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         HGDIOBJ old_font = SelectObject(screen_dc, active_font);
-        SIZE line1_size{};
-        SIZE line2_size{};
         const DisplayLines sample_lines = GetMetricsSampleLines(app_config_.visible_metrics);
-        GetTextExtentPoint32W(screen_dc,
-                              sample_lines.line1.c_str(),
-                              static_cast<int>(sample_lines.line1.size()),
-                              &line1_size);
-        GetTextExtentPoint32W(screen_dc,
-                              sample_lines.line2.c_str(),
-                              static_cast<int>(sample_lines.line2.size()),
-                              &line2_size);
+        const int column_gap = ScaleByDpi(current_dpi_, 8);
+        column_widths_ = MeasureColumnWidths(screen_dc, sample_lines.columns);
         TEXTMETRICW text_metrics{};
         GetTextMetricsW(screen_dc, &text_metrics);
+
+        HFONT popup_font =
+            popup_font_ != nullptr ? popup_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        SelectObject(screen_dc, popup_font);
+        TEXTMETRICW popup_text_metrics{};
+        GetTextMetricsW(screen_dc, &popup_text_metrics);
+
+        HFONT popup_title_font =
+            popup_title_font_ != nullptr ? popup_title_font_
+                                         : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        SelectObject(screen_dc, popup_title_font);
+        TEXTMETRICW popup_title_metrics{};
+        GetTextMetricsW(screen_dc, &popup_title_metrics);
+
         SelectObject(screen_dc, old_font);
         ReleaseDC(nullptr, screen_dc);
 
         text_line_height_ = text_metrics.tmHeight;
+        popup_text_line_height_ = popup_text_metrics.tmHeight;
+        popup_title_line_height_ = popup_title_metrics.tmHeight;
         const int horizontal_padding = ScaleByDpi(current_dpi_, 8);
         const int vertical_padding = ScaleByDpi(current_dpi_, 5);
         const int line_gap = ScaleByDpi(current_dpi_, 2);
         const bool has_second_line = !sample_lines.line2.empty();
+        const int content_width = SumColumnWidths(column_widths_, column_gap);
 
-        widget_size_.cx = std::max(line1_size.cx, line2_size.cx) + horizontal_padding * 2;
+        widget_size_.cx = content_width + horizontal_padding * 2;
         widget_size_.cy =
             std::max<int>((has_second_line ? text_line_height_ * 2 + line_gap : text_line_height_) +
                               vertical_padding * 2,
-                          ScaleByDpi(current_dpi_, has_second_line ? 32 : 24));
+                         ScaleByDpi(current_dpi_, has_second_line ? 32 : 24));
+
+        UpdateHoverPopupSize();
     }
 
     void UpdateDisplayLines(const MetricsSnapshot& snapshot) {
         const DisplayLines lines = FormatMetricsLines(snapshot, app_config_.visible_metrics);
         line1_text_ = lines.line1;
         line2_text_ = lines.line2;
+        display_columns_ = lines.columns;
         has_second_line_ = !line2_text_.empty();
     }
 
@@ -544,6 +777,7 @@ private:
         const int horizontal_padding = ScaleByDpi(current_dpi_, 8);
         const int vertical_padding = ScaleByDpi(current_dpi_, 4);
         const int line_gap = ScaleByDpi(current_dpi_, 2);
+        const int column_gap = ScaleByDpi(current_dpi_, 8);
         const int centered_offset = std::max<int>(
             0, ((client_rect.bottom - client_rect.top) - text_line_height_) / 2);
         const int line1_top =
@@ -558,23 +792,779 @@ private:
                         client_rect.right - horizontal_padding,
                         client_rect.top + vertical_padding + text_line_height_ * 2 + line_gap};
 
-        SetTextColor(dc, palette.primary_text);
-        DrawTextW(dc,
-                  line1_text_.c_str(),
-                  static_cast<int>(line1_text_.size()),
-                  &line1_rect,
-                  DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+        if (!display_columns_.empty()) {
+            std::vector<int> active_column_widths = column_widths_;
+            if (active_column_widths.size() != display_columns_.size()) {
+                active_column_widths = MeasureColumnWidths(dc, display_columns_);
+            }
 
-        if (has_second_line_) {
-            SetTextColor(dc, palette.secondary_text);
+            int current_x = client_rect.left + horizontal_padding;
+            for (size_t i = 0; i < display_columns_.size(); ++i) {
+                const int column_width = active_column_widths[i];
+                RECT column_line1_rect{current_x,
+                                       line1_rect.top,
+                                       current_x + column_width,
+                                       line1_rect.bottom};
+                RECT column_line2_rect{current_x,
+                                       line2_rect.top,
+                                       current_x + column_width,
+                                       line2_rect.bottom};
+
+                if (!display_columns_[i].top_text.empty()) {
+                    SetTextColor(dc, palette.primary_text);
+                    DrawTextW(dc,
+                              display_columns_[i].top_text.c_str(),
+                              static_cast<int>(display_columns_[i].top_text.size()),
+                              &column_line1_rect,
+                              DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+                }
+
+                if (has_second_line_ && !display_columns_[i].bottom_text.empty()) {
+                    SetTextColor(dc, palette.secondary_text);
+                    DrawTextW(dc,
+                              display_columns_[i].bottom_text.c_str(),
+                              static_cast<int>(display_columns_[i].bottom_text.size()),
+                              &column_line2_rect,
+                              DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+                }
+
+                current_x += column_width + column_gap;
+            }
+        } else {
+            SetTextColor(dc, palette.primary_text);
             DrawTextW(dc,
-                      line2_text_.c_str(),
-                      static_cast<int>(line2_text_.size()),
-                      &line2_rect,
+                      line1_text_.c_str(),
+                      static_cast<int>(line1_text_.size()),
+                      &line1_rect,
                       DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            if (has_second_line_) {
+                SetTextColor(dc, palette.secondary_text);
+                DrawTextW(dc,
+                          line2_text_.c_str(),
+                          static_cast<int>(line2_text_.size()),
+                          &line2_rect,
+                          DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+            }
         }
 
         SelectObject(dc, old_font);
+    }
+
+    HoverPopupTableLayout ComputeHoverPopupTableLayout(const RECT& client_rect) const {
+        const int padding_left = ScaleByDpi(current_dpi_, 16);
+        const int padding_right = ScaleByDpi(current_dpi_, 30);
+        const int gap = ScaleByDpi(current_dpi_, 8);
+        const int line_gap = ScaleByDpi(current_dpi_, 4);
+        const int inner_padding = ScaleByDpi(current_dpi_, 6);
+        const int content_left = client_rect.left + padding_left;
+        const int content_right = client_rect.right - padding_right;
+        const int content_top =
+            client_rect.top + padding_left + popup_title_line_height_ + gap;
+        const int table_top =
+            content_top + popup_text_line_height_ * 3 + line_gap * 2 + gap;
+
+        HoverPopupTableLayout layout{};
+        layout.header_rect = {content_left,
+                              table_top,
+                              content_right,
+                              table_top + popup_text_line_height_ + ScaleByDpi(current_dpi_, 8)};
+
+        const int rank_width = ScaleByDpi(current_dpi_, 24);
+        const int cpu_width = ScaleByDpi(current_dpi_, 56);
+        const int mem_width = ScaleByDpi(current_dpi_, 190);
+        const int gpu_width = ScaleByDpi(current_dpi_, 54);
+        const int vram_width = ScaleByDpi(current_dpi_, 82);
+        const int io_width = ScaleByDpi(current_dpi_, 92);
+        const int net_width = ScaleByDpi(current_dpi_, 92);
+        const int table_gap = ScaleByDpi(current_dpi_, 10);
+        const int table_left = layout.header_rect.left + inner_padding;
+        const int table_right =
+            std::max(table_left, static_cast<int>(layout.header_rect.right) - inner_padding);
+        const int available_width = table_right - table_left;
+        const int fixed_width = rank_width + cpu_width + mem_width + gpu_width + vram_width +
+                                io_width + net_width + table_gap * 6;
+        const int name_width = std::max(0, available_width - fixed_width);
+
+        int x = table_left;
+        layout.rank_rect = {x, layout.header_rect.top, x + rank_width, layout.header_rect.bottom};
+        x = layout.rank_rect.right + table_gap;
+        layout.name_rect = {x, layout.header_rect.top, x + name_width, layout.header_rect.bottom};
+        x = layout.name_rect.right + table_gap;
+        layout.cpu_rect = {x, layout.header_rect.top, x + cpu_width, layout.header_rect.bottom};
+        x = layout.cpu_rect.right + table_gap;
+        layout.mem_rect = {x, layout.header_rect.top, x + mem_width, layout.header_rect.bottom};
+        x = layout.mem_rect.right + table_gap;
+        layout.gpu_rect = {x, layout.header_rect.top, x + gpu_width, layout.header_rect.bottom};
+        x = layout.gpu_rect.right + table_gap;
+        layout.vram_rect = {x, layout.header_rect.top, x + vram_width, layout.header_rect.bottom};
+        x = layout.vram_rect.right + table_gap;
+        layout.io_rect = {x, layout.header_rect.top, x + io_width, layout.header_rect.bottom};
+        x = layout.io_rect.right + table_gap;
+        layout.net_rect = {x, layout.header_rect.top, x + net_width, layout.header_rect.bottom};
+        return layout;
+    }
+
+    std::wstring GetHoverPopupHeaderText(const wchar_t* label, HoverPopupSortMode mode) const {
+        std::wstring text = label;
+        if (hover_popup_sort_mode_ == mode && mode != HoverPopupSortMode::kDefault) {
+            text += L" ↓";
+        }
+        return text;
+    }
+
+    std::wstring GetHoverPopupSubtitle() const {
+        switch (hover_popup_sort_mode_) {
+        case HoverPopupSortMode::kCpu:
+            return L"Top 10 processes sorted by CPU";
+        case HoverPopupSortMode::kMemory:
+            return L"Top 10 processes sorted by memory (USS -> RSS -> VMS)";
+        case HoverPopupSortMode::kGpu:
+            return L"Top 10 processes sorted by GPU";
+        case HoverPopupSortMode::kVram:
+            return L"Top 10 processes sorted by VRAM";
+        case HoverPopupSortMode::kIo:
+            return L"Top 10 processes sorted by IO";
+        case HoverPopupSortMode::kNetwork:
+            return L"Top 10 processes sorted by network";
+        case HoverPopupSortMode::kDefault:
+        default:
+            return L"Top 10 processes by blended pressure score";
+        }
+    }
+
+    void ApplyHoverPopupSort() {
+        hover_popup_snapshot_ = hover_popup_base_snapshot_;
+        if (hover_popup_sort_mode_ == HoverPopupSortMode::kDefault) {
+            return;
+        }
+
+        auto default_compare = [](const ProcessPopupItem& left, const ProcessPopupItem& right) {
+            if (std::abs(left.score - right.score) > 0.01) {
+                return left.score > right.score;
+            }
+            if (std::abs(left.cpu_percent - right.cpu_percent) > 0.01) {
+                return left.cpu_percent > right.cpu_percent;
+            }
+            if (left.uss_bytes != right.uss_bytes) {
+                return left.uss_bytes > right.uss_bytes;
+            }
+            if (left.rss_bytes != right.rss_bytes) {
+                return left.rss_bytes > right.rss_bytes;
+            }
+            if (left.vms_bytes != right.vms_bytes) {
+                return left.vms_bytes > right.vms_bytes;
+            }
+            if (std::abs(left.gpu_percent - right.gpu_percent) > 0.01) {
+                return left.gpu_percent > right.gpu_percent;
+            }
+            if (left.vram_bytes != right.vram_bytes) {
+                return left.vram_bytes > right.vram_bytes;
+            }
+            const unsigned long long left_io =
+                left.io_read_bytes_per_second + left.io_write_bytes_per_second;
+            const unsigned long long right_io =
+                right.io_read_bytes_per_second + right.io_write_bytes_per_second;
+            if (left_io != right_io) {
+                return left_io > right_io;
+            }
+            if (left.network_bytes_per_second != right.network_bytes_per_second) {
+                return left.network_bytes_per_second > right.network_bytes_per_second;
+            }
+            return left.pid < right.pid;
+        };
+
+        const auto compare_with_tie_break =
+            [&default_compare](auto metric_compare) {
+                return [default_compare, metric_compare](const ProcessPopupItem& left,
+                                                         const ProcessPopupItem& right) {
+                    if (metric_compare(left, right)) {
+                        return true;
+                    }
+                    if (metric_compare(right, left)) {
+                        return false;
+                    }
+                    return default_compare(left, right);
+                };
+            };
+
+        switch (hover_popup_sort_mode_) {
+        case HoverPopupSortMode::kCpu:
+            std::stable_sort(hover_popup_snapshot_.top_processes.begin(),
+                             hover_popup_snapshot_.top_processes.end(),
+                             compare_with_tie_break([](const ProcessPopupItem& left,
+                                                       const ProcessPopupItem& right) {
+                                 return std::abs(left.cpu_percent - right.cpu_percent) > 0.01 &&
+                                        left.cpu_percent > right.cpu_percent;
+                             }));
+            break;
+        case HoverPopupSortMode::kMemory:
+            std::stable_sort(hover_popup_snapshot_.top_processes.begin(),
+                             hover_popup_snapshot_.top_processes.end(),
+                             compare_with_tie_break([](const ProcessPopupItem& left,
+                                                       const ProcessPopupItem& right) {
+                                 if (left.uss_bytes != right.uss_bytes) {
+                                     return left.uss_bytes > right.uss_bytes;
+                                 }
+                                 if (left.rss_bytes != right.rss_bytes) {
+                                     return left.rss_bytes > right.rss_bytes;
+                                 }
+                                 if (left.vms_bytes != right.vms_bytes) {
+                                     return left.vms_bytes > right.vms_bytes;
+                                 }
+                                 return false;
+                             }));
+            break;
+        case HoverPopupSortMode::kGpu:
+            std::stable_sort(hover_popup_snapshot_.top_processes.begin(),
+                             hover_popup_snapshot_.top_processes.end(),
+                             compare_with_tie_break([](const ProcessPopupItem& left,
+                                                       const ProcessPopupItem& right) {
+                                 if (std::abs(left.gpu_percent - right.gpu_percent) > 0.01) {
+                                     return left.gpu_percent > right.gpu_percent;
+                                 }
+                                 if (left.vram_bytes != right.vram_bytes) {
+                                     return left.vram_bytes > right.vram_bytes;
+                                 }
+                                 return false;
+                             }));
+            break;
+        case HoverPopupSortMode::kVram:
+            std::stable_sort(hover_popup_snapshot_.top_processes.begin(),
+                             hover_popup_snapshot_.top_processes.end(),
+                             compare_with_tie_break([](const ProcessPopupItem& left,
+                                                       const ProcessPopupItem& right) {
+                                 return left.vram_bytes != right.vram_bytes &&
+                                        left.vram_bytes > right.vram_bytes;
+                             }));
+            break;
+        case HoverPopupSortMode::kIo:
+            std::stable_sort(hover_popup_snapshot_.top_processes.begin(),
+                             hover_popup_snapshot_.top_processes.end(),
+                             compare_with_tie_break([](const ProcessPopupItem& left,
+                                                       const ProcessPopupItem& right) {
+                                 const unsigned long long left_io =
+                                     left.io_read_bytes_per_second + left.io_write_bytes_per_second;
+                                 const unsigned long long right_io =
+                                     right.io_read_bytes_per_second + right.io_write_bytes_per_second;
+                                 return left_io != right_io && left_io > right_io;
+                             }));
+            break;
+        case HoverPopupSortMode::kNetwork:
+            std::stable_sort(hover_popup_snapshot_.top_processes.begin(),
+                             hover_popup_snapshot_.top_processes.end(),
+                             compare_with_tie_break([](const ProcessPopupItem& left,
+                                                       const ProcessPopupItem& right) {
+                                 return left.network_bytes_per_second != right.network_bytes_per_second &&
+                                        left.network_bytes_per_second >
+                                            right.network_bytes_per_second;
+                             }));
+            break;
+        case HoverPopupSortMode::kDefault:
+        default:
+            break;
+        }
+    }
+
+    HoverPopupSortMode HitTestHoverPopupSortMode(const POINT& client_point) const {
+        if (hover_popup_window_ == nullptr || !IsWindow(hover_popup_window_)) {
+            return HoverPopupSortMode::kDefault;
+        }
+
+        RECT client_rect{};
+        GetClientRect(hover_popup_window_, &client_rect);
+        const HoverPopupTableLayout layout = ComputeHoverPopupTableLayout(client_rect);
+        if (PtInRect(&layout.cpu_rect, client_point)) {
+            return HoverPopupSortMode::kCpu;
+        }
+        if (PtInRect(&layout.mem_rect, client_point)) {
+            return HoverPopupSortMode::kMemory;
+        }
+        if (PtInRect(&layout.gpu_rect, client_point)) {
+            return HoverPopupSortMode::kGpu;
+        }
+        if (PtInRect(&layout.vram_rect, client_point)) {
+            return HoverPopupSortMode::kVram;
+        }
+        if (PtInRect(&layout.io_rect, client_point)) {
+            return HoverPopupSortMode::kIo;
+        }
+        if (PtInRect(&layout.net_rect, client_point)) {
+            return HoverPopupSortMode::kNetwork;
+        }
+        return HoverPopupSortMode::kDefault;
+    }
+
+    void ToggleHoverPopupSort(HoverPopupSortMode mode) {
+        if (mode == HoverPopupSortMode::kDefault) {
+            return;
+        }
+
+        hover_popup_sort_mode_ =
+            (hover_popup_sort_mode_ == mode) ? HoverPopupSortMode::kDefault : mode;
+        ApplyHoverPopupSort();
+        UpdateHoverPopupSize();
+        PositionHoverPopup();
+        RequestHoverPopupRedraw();
+    }
+
+    void HandleHoverPopupClick(const POINT& client_point) {
+        ToggleHoverPopupSort(HitTestHoverPopupSortMode(client_point));
+    }
+
+    void UpdateHoverPopupSize() {
+        const int padding = ScaleByDpi(current_dpi_, 16);
+        const int title_gap = ScaleByDpi(current_dpi_, 8);
+        const int summary_gap = ScaleByDpi(current_dpi_, 4);
+        const int section_gap = ScaleByDpi(current_dpi_, 10);
+        const int header_height = popup_text_line_height_ + ScaleByDpi(current_dpi_, 8);
+        const int row_height = popup_text_line_height_ + ScaleByDpi(current_dpi_, 8);
+        const int footer_height =
+            popup_text_line_height_ * 2 + ScaleByDpi(current_dpi_, 10);
+        const int row_count =
+            std::max<int>(1, static_cast<int>(hover_popup_snapshot_.top_processes.size()));
+
+        hover_popup_size_.cx = ScaleByDpi(current_dpi_, 980);
+        hover_popup_size_.cy = padding + popup_title_line_height_ + title_gap +
+                               (popup_text_line_height_ + summary_gap) * 3 + section_gap +
+                               header_height + row_count * row_height + footer_height + padding;
+    }
+
+    void DrawHoverPopupContents(HDC dc, const RECT& client_rect) {
+        const bool light_theme = IsLightTaskbarTheme();
+        const HoverPopupPalette palette = GetHoverPopupPalette(light_theme);
+
+        HBRUSH background_brush = CreateSolidBrush(palette.background);
+        FillRect(dc, &client_rect, background_brush);
+        DeleteObject(background_brush);
+
+        HBRUSH border_brush = CreateSolidBrush(palette.border);
+        FrameRect(dc, &client_rect, border_brush);
+        DeleteObject(border_brush);
+
+        RECT accent_rect{client_rect.left, client_rect.top, client_rect.right,
+                         client_rect.top + ScaleByDpi(current_dpi_, 3)};
+        HBRUSH accent_brush = CreateSolidBrush(palette.accent);
+        FillRect(dc, &accent_rect, accent_brush);
+        DeleteObject(accent_brush);
+
+        const int padding_left = ScaleByDpi(current_dpi_, 16);
+        const int padding_right = ScaleByDpi(current_dpi_, 30);
+        const int gap = ScaleByDpi(current_dpi_, 8);
+        const int line_gap = ScaleByDpi(current_dpi_, 4);
+        const int row_gap = ScaleByDpi(current_dpi_, 6);
+        const int content_left = client_rect.left + padding_left;
+        const int content_right = client_rect.right - padding_right;
+
+        SetBkMode(dc, TRANSPARENT);
+
+        HFONT title_font =
+            popup_title_font_ != nullptr ? popup_title_font_
+                                         : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        HFONT body_font =
+            popup_font_ != nullptr ? popup_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        HGDIOBJ old_font = SelectObject(dc, title_font);
+
+        RECT title_rect{content_left,
+                        client_rect.top + padding_left,
+                        content_right,
+                        client_rect.top + padding_left + popup_title_line_height_};
+        SetTextColor(dc, palette.title_text);
+        DrawTextW(dc,
+                  L"Performance Snapshot",
+                  -1,
+                  &title_rect,
+                  DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        RECT subtitle_rect{content_left,
+                           client_rect.top + padding_left,
+                           content_right,
+                           client_rect.top + padding_left + popup_title_line_height_};
+        SetTextColor(dc, palette.secondary_text);
+        DrawTextW(dc,
+                  GetHoverPopupSubtitle().c_str(),
+                  -1,
+                  &subtitle_rect,
+                  DT_SINGLELINE | DT_RIGHT | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        SelectObject(dc, body_font);
+
+        int content_top = title_rect.bottom + gap;
+        RECT line_rect{content_left, content_top, content_right,
+                       content_top + popup_text_line_height_};
+
+        const std::wstring gpu_summary =
+            last_snapshot_.gpu_percent >= 0 ? std::to_wstring(last_snapshot_.gpu_percent) + L"%"
+                                            : L"--";
+        const std::wstring summary_line1 =
+            L"CPU " + std::to_wstring(std::max(last_snapshot_.cpu_percent, 0)) + L"%   MEM " +
+            std::to_wstring(std::max(last_snapshot_.memory_percent, 0)) + L"%   GPU " +
+            gpu_summary + L"   PROC " +
+            std::to_wstring(std::max(hover_popup_snapshot_.total_process_count, 0));
+        const std::wstring summary_line2 =
+            L"NET \u2191 " + FormatRate(last_snapshot_.upload_bytes_per_second) + L"   \u2193 " +
+            FormatRate(last_snapshot_.download_bytes_per_second) + L"   DISK R " +
+            FormatRate(last_snapshot_.disk_read_bytes_per_second) + L"   W " +
+            FormatRate(last_snapshot_.disk_write_bytes_per_second);
+        const std::wstring summary_line3 =
+            L"Uptime " + FormatUptime(hover_popup_snapshot_.uptime_ms) +
+            L"   MEM = RSS / USS / VMS(commit)   VRAM = dedicated GPU memory";
+
+        SetTextColor(dc, palette.primary_text);
+        DrawTextW(dc,
+                  summary_line1.c_str(),
+                  -1,
+                  &line_rect,
+                  DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+        OffsetRect(&line_rect, 0, popup_text_line_height_ + line_gap);
+        DrawTextW(dc,
+                  summary_line2.c_str(),
+                  -1,
+                  &line_rect,
+                  DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+        OffsetRect(&line_rect, 0, popup_text_line_height_ + line_gap);
+        SetTextColor(dc, palette.secondary_text);
+        DrawTextW(dc,
+                  summary_line3.c_str(),
+                  -1,
+                  &line_rect,
+                  DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        const HoverPopupTableLayout table_layout = ComputeHoverPopupTableLayout(client_rect);
+        const RECT& header_rect = table_layout.header_rect;
+        HBRUSH header_brush = CreateSolidBrush(palette.header_fill);
+        FillRect(dc, &header_rect, header_brush);
+        DeleteObject(header_brush);
+
+        auto draw_header = [&](const std::wstring& text,
+                               const RECT& rect,
+                               UINT format,
+                               HoverPopupSortMode mode = HoverPopupSortMode::kDefault) {
+            SetTextColor(dc,
+                         hover_popup_sort_mode_ == mode && mode != HoverPopupSortMode::kDefault
+                             ? palette.title_text
+                             : palette.secondary_text);
+            RECT draw_rect = rect;
+            DrawTextW(dc,
+                      text.c_str(),
+                      -1,
+                      &draw_rect,
+                      format | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        };
+
+        draw_header(L"#", table_layout.rank_rect, DT_LEFT);
+        draw_header(L"Process", table_layout.name_rect, DT_LEFT);
+        draw_header(GetHoverPopupHeaderText(L"CPU", HoverPopupSortMode::kCpu),
+                    table_layout.cpu_rect,
+                    DT_RIGHT,
+                    HoverPopupSortMode::kCpu);
+        draw_header(GetHoverPopupHeaderText(L"MEM (R/U/V)", HoverPopupSortMode::kMemory),
+                    table_layout.mem_rect,
+                    DT_RIGHT,
+                    HoverPopupSortMode::kMemory);
+        draw_header(GetHoverPopupHeaderText(L"GPU", HoverPopupSortMode::kGpu),
+                    table_layout.gpu_rect,
+                    DT_RIGHT,
+                    HoverPopupSortMode::kGpu);
+        draw_header(GetHoverPopupHeaderText(L"VRAM", HoverPopupSortMode::kVram),
+                    table_layout.vram_rect,
+                    DT_RIGHT,
+                    HoverPopupSortMode::kVram);
+        draw_header(GetHoverPopupHeaderText(L"IO", HoverPopupSortMode::kIo),
+                    table_layout.io_rect,
+                    DT_RIGHT,
+                    HoverPopupSortMode::kIo);
+        draw_header(GetHoverPopupHeaderText(hover_popup_snapshot_.network_is_estimated ? L"NET*" : L"NET",
+                                            HoverPopupSortMode::kNetwork),
+                    table_layout.net_rect,
+                    DT_RIGHT,
+                    HoverPopupSortMode::kNetwork);
+
+        const int row_height = popup_text_line_height_ + ScaleByDpi(current_dpi_, 8);
+        int row_top = header_rect.bottom + row_gap;
+        if (hover_popup_snapshot_.top_processes.empty()) {
+            RECT empty_rect{content_left,
+                            row_top,
+                            content_right,
+                            row_top + row_height};
+            SetTextColor(dc, palette.secondary_text);
+            DrawTextW(dc,
+                      L"Process data is warming up. Keep the popup open for a second.",
+                      -1,
+                      &empty_rect,
+                      DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        } else {
+            for (size_t index = 0; index < hover_popup_snapshot_.top_processes.size(); ++index) {
+                const ProcessPopupItem& item = hover_popup_snapshot_.top_processes[index];
+                RECT row_rect{content_left, row_top, content_right,
+                              row_top + row_height};
+
+                if ((index % 2) == 0) {
+                    HBRUSH row_brush = CreateSolidBrush(palette.row_highlight);
+                    FillRect(dc, &row_rect, row_brush);
+                    DeleteObject(row_brush);
+                }
+                if (index < 3) {
+                    RECT marker_rect{row_rect.left, row_rect.top, row_rect.left + ScaleByDpi(current_dpi_, 3),
+                                     row_rect.bottom};
+                    HBRUSH marker_brush = CreateSolidBrush(palette.accent);
+                    FillRect(dc, &marker_rect, marker_brush);
+                    DeleteObject(marker_brush);
+                }
+
+                RECT current_rank_rect{table_layout.rank_rect.left,
+                                       row_rect.top,
+                                       table_layout.rank_rect.right,
+                                       row_rect.bottom};
+                RECT current_name_rect{table_layout.name_rect.left,
+                                       row_rect.top,
+                                       table_layout.name_rect.right,
+                                       row_rect.bottom};
+                RECT current_cpu_rect{table_layout.cpu_rect.left,
+                                      row_rect.top,
+                                      table_layout.cpu_rect.right,
+                                      row_rect.bottom};
+                RECT current_mem_rect{table_layout.mem_rect.left,
+                                      row_rect.top,
+                                      table_layout.mem_rect.right,
+                                      row_rect.bottom};
+                RECT current_gpu_rect{table_layout.gpu_rect.left,
+                                      row_rect.top,
+                                      table_layout.gpu_rect.right,
+                                      row_rect.bottom};
+                RECT current_vram_rect{table_layout.vram_rect.left,
+                                       row_rect.top,
+                                       table_layout.vram_rect.right,
+                                       row_rect.bottom};
+                RECT current_io_rect{table_layout.io_rect.left,
+                                     row_rect.top,
+                                     table_layout.io_rect.right,
+                                     row_rect.bottom};
+                RECT current_net_rect{table_layout.net_rect.left,
+                                      row_rect.top,
+                                      table_layout.net_rect.right,
+                                      row_rect.bottom};
+
+                const std::wstring rank_text = std::to_wstring(index + 1);
+                const std::wstring cpu_text = FormatPercentValue(item.cpu_percent);
+                const std::wstring mem_text =
+                    FormatBytes(item.rss_bytes) + L" / " + FormatBytes(item.uss_bytes) + L" / " +
+                    FormatBytes(item.vms_bytes);
+                const std::wstring gpu_text =
+                    last_snapshot_.gpu_percent >= 0 ? FormatPercentValue(item.gpu_percent) : L"--";
+                const std::wstring vram_text = FormatBytes(item.vram_bytes);
+                const std::wstring io_text =
+                    FormatRate(item.io_read_bytes_per_second + item.io_write_bytes_per_second);
+                const std::wstring net_text = hover_popup_snapshot_.network_metric_available
+                                                  ? FormatRate(item.network_bytes_per_second)
+                                                  : L"--";
+
+                SetTextColor(dc, palette.secondary_text);
+                DrawTextW(dc,
+                          rank_text.c_str(),
+                          -1,
+                          &current_rank_rect,
+                          DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                SetTextColor(dc, palette.primary_text);
+                DrawTextW(dc,
+                          item.name.c_str(),
+                          -1,
+                          &current_name_rect,
+                          DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                DrawTextW(dc,
+                          cpu_text.c_str(),
+                          -1,
+                          &current_cpu_rect,
+                          DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                DrawTextW(dc,
+                          mem_text.c_str(),
+                          -1,
+                          &current_mem_rect,
+                          DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                DrawTextW(dc,
+                          gpu_text.c_str(),
+                          -1,
+                          &current_gpu_rect,
+                          DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                DrawTextW(dc,
+                          vram_text.c_str(),
+                          -1,
+                          &current_vram_rect,
+                          DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                DrawTextW(dc,
+                          io_text.c_str(),
+                          -1,
+                          &current_io_rect,
+                          DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                DrawTextW(dc,
+                          net_text.c_str(),
+                          -1,
+                          &current_net_rect,
+                          DT_SINGLELINE | DT_RIGHT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+                row_top += row_height;
+            }
+        }
+
+        RECT footer_rect1{content_left,
+                          client_rect.bottom - padding_left - popup_text_line_height_ * 2 - line_gap,
+                          content_right,
+                          client_rect.bottom - padding_left - popup_text_line_height_ - line_gap};
+        RECT footer_rect2{content_left,
+                          client_rect.bottom - padding_left - popup_text_line_height_,
+                          content_right,
+                          client_rect.bottom - padding_left};
+        SetTextColor(dc, palette.secondary_text);
+        DrawTextW(dc,
+                  L"* MEM shows RSS / USS / VMS(commit, psutil/taskmgr-style). PSS is not exposed directly yet.",
+                  -1,
+                  &footer_rect1,
+                  DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+        DrawTextW(dc,
+                  L"* VRAM shows dedicated GPU memory. NET is estimated from per-process IO-other activity on Windows.",
+                  -1,
+                  &footer_rect2,
+                  DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        SelectObject(dc, old_font);
+    }
+
+    void PaintHoverPopup() {
+        PAINTSTRUCT paint_struct{};
+        HDC dc = BeginPaint(hover_popup_window_, &paint_struct);
+
+        RECT client_rect{};
+        GetClientRect(hover_popup_window_, &client_rect);
+        DrawHoverPopupContents(dc, client_rect);
+        EndPaint(hover_popup_window_, &paint_struct);
+    }
+
+    void RequestHoverPopupRedraw() {
+        if (hover_popup_window_ == nullptr || !IsWindow(hover_popup_window_) || !hover_popup_visible_) {
+            return;
+        }
+
+        RedrawWindow(hover_popup_window_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    }
+
+    bool IsCursorOverWidgetOrPopup() const {
+        POINT cursor_pos{};
+        GetCursorPos(&cursor_pos);
+        return IsPointInWindowRect(widget_window_, cursor_pos) ||
+               (hover_popup_visible_ && IsPointInWindowRect(hover_popup_window_, cursor_pos));
+    }
+
+    void RefreshHoverPopupData() {
+        hover_popup_base_snapshot_ = process_monitor_.Sample(last_snapshot_);
+        ApplyHoverPopupSort();
+        UpdateHoverPopupSize();
+    }
+
+    void PositionHoverPopup() {
+        if (hover_popup_window_ == nullptr || !IsWindow(hover_popup_window_) || widget_window_ == nullptr ||
+            !IsWindow(widget_window_)) {
+            return;
+        }
+
+        RECT widget_rect{};
+        if (!GetWindowRect(widget_window_, &widget_rect)) {
+            return;
+        }
+
+        HMONITOR monitor_handle = MonitorFromRect(&widget_rect, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitor_info{};
+        monitor_info.cbSize = sizeof(monitor_info);
+        if (!GetMonitorInfoW(monitor_handle, &monitor_info)) {
+            return;
+        }
+
+        const RECT bounds = monitor_info.rcMonitor;
+        const int gap = ScaleByDpi(current_dpi_, 8);
+
+        const int min_x = static_cast<int>(bounds.left) + gap;
+        const int max_x =
+            std::max<int>(min_x, static_cast<int>(bounds.right) - hover_popup_size_.cx - gap);
+        const int min_y = static_cast<int>(bounds.top) + gap;
+        const int max_y =
+            std::max<int>(min_y, static_cast<int>(bounds.bottom) - hover_popup_size_.cy - gap);
+
+        const int space_above = static_cast<int>(widget_rect.top - bounds.top);
+        const int space_below = static_cast<int>(bounds.bottom - widget_rect.bottom);
+        const int space_left = static_cast<int>(widget_rect.left - bounds.left);
+        const int space_right = static_cast<int>(bounds.right - widget_rect.right);
+
+        int x = std::clamp<int>(static_cast<int>(widget_rect.right) - hover_popup_size_.cx, min_x, max_x);
+        int y = 0;
+
+        const bool prefer_vertical =
+            std::max(space_above, space_below) >= std::max(space_left, space_right);
+        if (prefer_vertical) {
+            if (space_above >= hover_popup_size_.cy + gap || space_above >= space_below) {
+                y = widget_rect.top - hover_popup_size_.cy - gap;
+            } else {
+                y = widget_rect.bottom + gap;
+            }
+            y = std::clamp<int>(y, min_y, max_y);
+        } else {
+            if (space_left >= hover_popup_size_.cx + gap || space_left >= space_right) {
+                x = static_cast<int>(widget_rect.left) - hover_popup_size_.cx - gap;
+            } else {
+                x = static_cast<int>(widget_rect.right) + gap;
+            }
+            x = std::clamp<int>(x, min_x, max_x);
+            y = std::clamp<int>(static_cast<int>(widget_rect.bottom) - hover_popup_size_.cy,
+                                min_y,
+                                max_y);
+        }
+
+        SetWindowPos(hover_popup_window_,
+                     HWND_TOPMOST,
+                     x,
+                     y,
+                     hover_popup_size_.cx,
+                     hover_popup_size_.cy,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    void ShowHoverPopup() {
+        if (!EnsureHoverPopupWindow()) {
+            return;
+        }
+
+        KillTimer(controller_window_, kHoverHideTimerId);
+        RefreshHoverPopupData();
+        PositionHoverPopup();
+        ShowWindow(hover_popup_window_, SW_SHOWNOACTIVATE);
+        hover_popup_visible_ = true;
+        RequestHoverPopupRedraw();
+    }
+
+    void HideHoverPopup() {
+        KillTimer(controller_window_, kHoverHideTimerId);
+        hover_popup_visible_ = false;
+        if (hover_popup_window_ != nullptr && IsWindow(hover_popup_window_)) {
+            ShowWindow(hover_popup_window_, SW_HIDE);
+        }
+    }
+
+    void ArmHoverHideTimer() {
+        if (controller_window_ == nullptr || !IsWindow(controller_window_)) {
+            return;
+        }
+        SetTimer(controller_window_, kHoverHideTimerId, kHoverHideDelayMs, nullptr);
+    }
+
+    void HandleHoverMove(HWND source_window) {
+        TRACKMOUSEEVENT track_event{};
+        track_event.cbSize = sizeof(track_event);
+        track_event.dwFlags = TME_LEAVE;
+        track_event.hwndTrack = source_window;
+        TrackMouseEvent(&track_event);
+
+        KillTimer(controller_window_, kHoverHideTimerId);
+        if (!hover_popup_visible_) {
+            ShowHoverPopup();
+        }
     }
 
     bool RenderLayeredWidget() {
@@ -664,6 +1654,11 @@ private:
         last_snapshot_ = metrics_.Sample();
         UpdateDisplayLines(last_snapshot_);
         RequestWidgetRedraw();
+        if (hover_popup_visible_) {
+            RefreshHoverPopupData();
+            PositionHoverPopup();
+            RequestHoverPopupRedraw();
+        }
     }
 
     bool SaveConfig() const {
@@ -677,10 +1672,15 @@ private:
             if (!embedder_.RefreshLayout(widget_window_, widget_size_)) {
                 ShowWindow(widget_window_, SW_HIDE);
                 SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
+                HideHoverPopup();
                 return;
             }
         }
         RequestWidgetRedraw();
+        if (hover_popup_visible_) {
+            PositionHoverPopup();
+            RequestHoverPopupRedraw();
+        }
     }
 
     bool ToggleMetricVisibility(UINT command_id) {
@@ -747,10 +1747,20 @@ private:
         RefreshFontAndSize();
         if (current_dpi_ != previous_dpi) {
             RequestWidgetRedraw();
+            if (hover_popup_visible_) {
+                PositionHoverPopup();
+                RequestHoverPopupRedraw();
+            }
         }
         if (!embedder_.RefreshLayout(widget_window_, widget_size_)) {
             ShowWindow(widget_window_, SW_HIDE);
             SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
+            HideHoverPopup();
+            return;
+        }
+
+        if (hover_popup_visible_) {
+            PositionHoverPopup();
         }
     }
 
@@ -775,6 +1785,7 @@ private:
     }
 
     void ShowContextMenu(POINT screen_point) {
+        HideHoverPopup();
         HMENU menu = CreatePopupMenu();
         HMENU metrics_menu = CreatePopupMenu();
         AppendMenuW(metrics_menu,
@@ -1011,6 +2022,7 @@ private:
         }
 
         if (message == app->taskbar_created_message_) {
+            app->HideHoverPopup();
             app->embedder_.Detach(app->widget_window_);
             app->tray_icon_added_ = false;
             SetTimer(window_handle, kReattachTimerId, kReattachDelayMs, nullptr);
@@ -1035,6 +2047,13 @@ private:
                 app->ReattachWidget();
                 return 0;
             }
+            if (w_param == kHoverHideTimerId) {
+                KillTimer(window_handle, kHoverHideTimerId);
+                if (!app->IsCursorOverWidgetOrPopup()) {
+                    app->HideHoverPopup();
+                }
+                return 0;
+            }
             break;
         case kTrayIconCallbackMessage:
             if (l_param == WM_RBUTTONUP || l_param == WM_CONTEXTMENU) {
@@ -1049,6 +2068,10 @@ private:
             app->RefreshFontAndSize();
             if (app->widget_window_ != nullptr && IsWindow(app->widget_window_)) {
                 app->RequestWidgetRedraw();
+            }
+            if (app->hover_popup_visible_) {
+                app->PositionHoverPopup();
+                app->RequestHoverPopupRedraw();
             }
             return 0;
         case WM_CLOSE:
@@ -1089,6 +2112,12 @@ private:
         case WM_PAINT:
             app->PaintWidget();
             return 0;
+        case WM_MOUSEMOVE:
+            app->HandleHoverMove(window_handle);
+            return 0;
+        case WM_MOUSELEAVE:
+            app->ArmHoverHideTimer();
+            return 0;
         case WM_RBUTTONUP: {
             POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
             ClientToScreen(window_handle, &point);
@@ -1108,6 +2137,7 @@ private:
         }
         case WM_NCDESTROY:
             if (app->widget_window_ == window_handle) {
+                app->HideHoverPopup();
                 app->widget_window_ = nullptr;
                 if (!app->is_shutting_down_ && app->controller_window_ != nullptr &&
                     IsWindow(app->controller_window_)) {
@@ -1123,24 +2153,105 @@ private:
         return DefWindowProcW(window_handle, message, w_param, l_param);
     }
 
+    static LRESULT CALLBACK HoverPopupWindowProc(HWND window_handle,
+                                                 UINT message,
+                                                 WPARAM w_param,
+                                                 LPARAM l_param) {
+        MonitorApp* app = nullptr;
+        if (message == WM_NCCREATE) {
+            auto* create_struct = reinterpret_cast<CREATESTRUCTW*>(l_param);
+            app = static_cast<MonitorApp*>(create_struct->lpCreateParams);
+            SetWindowLongPtrW(window_handle, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+            app->hover_popup_window_ = window_handle;
+        } else {
+            app = FromWindow(window_handle);
+        }
+
+        if (app == nullptr) {
+            return DefWindowProcW(window_handle, message, w_param, l_param);
+        }
+
+        switch (message) {
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT:
+            app->PaintHoverPopup();
+            return 0;
+        case WM_MOUSEMOVE:
+            app->HandleHoverMove(window_handle);
+            return 0;
+        case WM_MOUSELEAVE:
+            app->ArmHoverHideTimer();
+            return 0;
+        case WM_LBUTTONUP: {
+            POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
+            app->HandleHoverPopupClick(point);
+            return 0;
+        }
+        case WM_RBUTTONUP: {
+            POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
+            ClientToScreen(window_handle, &point);
+            app->ShowContextMenu(point);
+            return 0;
+        }
+        case WM_CONTEXTMENU: {
+            POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
+            if (point.x == -1 && point.y == -1) {
+                RECT rect{};
+                GetWindowRect(window_handle, &rect);
+                point.x = rect.left;
+                point.y = rect.bottom;
+            }
+            app->ShowContextMenu(point);
+            return 0;
+        }
+        case WM_NCDESTROY:
+            if (app->hover_popup_window_ == window_handle) {
+                app->hover_popup_window_ = nullptr;
+                app->hover_popup_visible_ = false;
+            }
+            SetWindowLongPtrW(window_handle, GWLP_USERDATA, 0);
+            break;
+        default:
+            break;
+        }
+
+        return DefWindowProcW(window_handle, message, w_param, l_param);
+    }
+
     HINSTANCE instance_handle_{nullptr};
     HWND controller_window_{nullptr};
     HWND widget_window_{nullptr};
+    HWND hover_popup_window_{nullptr};
     HFONT font_{nullptr};
+    HFONT popup_font_{nullptr};
+    HFONT popup_title_font_{nullptr};
     UINT current_dpi_{96};
     UINT taskbar_created_message_{0};
     SIZE widget_size_{};
+    SIZE hover_popup_size_{};
     int text_line_height_{0};
+    int popup_text_line_height_{0};
+    int popup_title_line_height_{0};
     bool has_second_line_{true};
     bool is_shutting_down_{false};
+    bool hover_popup_visible_{false};
     bool tray_icon_added_{false};
     HICON tray_icon_handle_{nullptr};
     ULONG_PTR gdiplus_token_{0};
     bool gdiplus_started_{false};
     AppConfig app_config_{};
     MetricsSnapshot last_snapshot_{};
+    ProcessPopupSnapshot hover_popup_base_snapshot_{};
+    ProcessPopupSnapshot hover_popup_snapshot_{};
+    HoverPopupSortMode hover_popup_sort_mode_{HoverPopupSortMode::kDefault};
     std::wstring line1_text_{L"CPU 0%  MEM 0%"};
     std::wstring line2_text_{L"\u2191 0B/s  \u2193 0B/s  R 0B/s  W 0B/s"};
+    std::vector<DisplayLines::Column> display_columns_{};
+    std::vector<int> column_widths_{};
+    ProcessMonitor process_monitor_{};
     SystemMetrics metrics_{};
     TaskbarEmbedder embedder_{};
 };

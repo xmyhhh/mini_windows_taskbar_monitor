@@ -35,4 +35,5 @@ cmake --build build --config Release
 - 不支持Win7
 
 ## Screenshot
-![screenshot](screenshot.png)
+![screenshot](screenshot1.png)
+

@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <string>
+#include <vector>
 
 namespace minimal_taskbar_monitor {
 
@@ -30,6 +31,11 @@ struct MetricVisibility {
 struct DisplayLines {
     std::wstring line1;
     std::wstring line2;
+    struct Column {
+        std::wstring top_text;
+        std::wstring bottom_text;
+    };
+    std::vector<Column> columns;
 };
 
 class SystemMetrics {

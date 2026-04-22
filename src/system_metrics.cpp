@@ -64,6 +64,65 @@ bool QueryThemeValue(DWORD& value) {
                         &value_size) == ERROR_SUCCESS;
 }
 
+std::wstring JoinSegments(const std::vector<std::wstring>& segments);
+
+void AddColumn(std::vector<DisplayLines::Column>& columns,
+               std::wstring top_text,
+               std::wstring bottom_text = L"") {
+    if (top_text.empty() && bottom_text.empty()) {
+        return;
+    }
+
+    columns.push_back({std::move(top_text), std::move(bottom_text)});
+}
+
+void AddOptionalPairColumn(std::vector<DisplayLines::Column>& columns,
+                           bool top_visible,
+                           std::wstring top_text,
+                           bool bottom_visible,
+                           std::wstring bottom_text) {
+    if (top_visible && bottom_visible) {
+        AddColumn(columns, std::move(top_text), std::move(bottom_text));
+    } else if (top_visible) {
+        AddColumn(columns, std::move(top_text));
+    } else if (bottom_visible) {
+        AddColumn(columns, std::move(bottom_text));
+    }
+}
+
+std::wstring JoinColumnTexts(const std::vector<DisplayLines::Column>& columns, bool top_line) {
+    std::vector<std::wstring> segments;
+    segments.reserve(columns.size());
+
+    for (const auto& column : columns) {
+        const std::wstring& text = top_line ? column.top_text : column.bottom_text;
+        if (!text.empty()) {
+            segments.push_back(text);
+        }
+    }
+
+    return JoinSegments(segments);
+}
+
+void NormalizeDisplayColumns(DisplayLines& lines) {
+    bool has_top_text = false;
+    bool has_bottom_text = false;
+    for (const auto& column : lines.columns) {
+        has_top_text = has_top_text || !column.top_text.empty();
+        has_bottom_text = has_bottom_text || !column.bottom_text.empty();
+    }
+
+    if (!has_top_text && has_bottom_text) {
+        for (auto& column : lines.columns) {
+            if (column.top_text.empty()) {
+                column.top_text = std::move(column.bottom_text);
+            } else {
+                column.bottom_text.clear();
+            }
+        }
+    }
+}
+
 std::wstring JoinSegments(const std::vector<std::wstring>& segments) {
     std::wstring result;
     for (size_t index = 0; index < segments.size(); ++index) {
@@ -76,12 +135,17 @@ std::wstring JoinSegments(const std::vector<std::wstring>& segments) {
 }
 
 void NormalizeDisplayLines(DisplayLines& lines) {
+    NormalizeDisplayColumns(lines);
+    lines.line1 = JoinColumnTexts(lines.columns, true);
+    lines.line2 = JoinColumnTexts(lines.columns, false);
+
     if (lines.line1.empty() && !lines.line2.empty()) {
         lines.line1 = lines.line2;
         lines.line2.clear();
     }
     if (lines.line1.empty()) {
         lines.line1 = L"No metrics";
+        lines.columns = {{L"No metrics", L""}};
     }
 }
 
@@ -406,79 +470,60 @@ bool SystemMetrics::QueryNetworkTotals(unsigned long long& total_in_bytes,
 DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
                                 const MetricVisibility& visibility) {
     DisplayLines lines{};
-    std::vector<std::wstring> line1_segments;
-    std::vector<std::wstring> line2_segments;
+    AddOptionalPairColumn(lines.columns,
+                          visibility.show_cpu,
+                          std::wstring(L"CPU ") +
+                              std::to_wstring(std::max(snapshot.cpu_percent, 0)) + L"%",
+                          visibility.show_memory,
+                          std::wstring(L"MEM ") +
+                              std::to_wstring(std::max(snapshot.memory_percent, 0)) + L"%");
 
-    if (visibility.show_cpu) {
-        line1_segments.push_back(std::wstring(L"CPU ") +
-                                 std::to_wstring(std::max(snapshot.cpu_percent, 0)) + L"%");
-    }
-    if (visibility.show_memory) {
-        line1_segments.push_back(std::wstring(L"MEM ") +
-                                 std::to_wstring(std::max(snapshot.memory_percent, 0)) + L"%");
-    }
     if (visibility.show_gpu) {
         if (snapshot.gpu_percent >= 0) {
-            line1_segments.push_back(std::wstring(L"GPU ") + std::to_wstring(snapshot.gpu_percent) +
-                                     L"%");
+            AddColumn(lines.columns,
+                      std::wstring(L"GPU ") + std::to_wstring(snapshot.gpu_percent) + L"%");
         } else {
-            line1_segments.push_back(L"GPU --");
+            AddColumn(lines.columns, L"GPU --");
         }
     }
 
-    if (visibility.show_upload) {
-        line2_segments.push_back(std::wstring(L"\u2191 ") +
-                                 FormatSpeed(snapshot.upload_bytes_per_second));
-    }
-    if (visibility.show_download) {
-        line2_segments.push_back(std::wstring(L"\u2193 ") +
-                                 FormatSpeed(snapshot.download_bytes_per_second));
-    }
-    if (visibility.show_disk_read) {
-        line2_segments.push_back(std::wstring(L"R ") +
-                                 FormatSpeed(snapshot.disk_read_bytes_per_second));
-    }
-    if (visibility.show_disk_write) {
-        line2_segments.push_back(std::wstring(L"W ") +
-                                 FormatSpeed(snapshot.disk_write_bytes_per_second));
-    }
+    AddOptionalPairColumn(lines.columns,
+                          visibility.show_upload,
+                          std::wstring(L"\u2191 ") +
+                              FormatSpeed(snapshot.upload_bytes_per_second),
+                          visibility.show_download,
+                          std::wstring(L"\u2193 ") +
+                              FormatSpeed(snapshot.download_bytes_per_second));
+    AddOptionalPairColumn(lines.columns,
+                          visibility.show_disk_read,
+                          std::wstring(L"R ") +
+                              FormatSpeed(snapshot.disk_read_bytes_per_second),
+                          visibility.show_disk_write,
+                          std::wstring(L"W ") +
+                              FormatSpeed(snapshot.disk_write_bytes_per_second));
 
-    lines.line1 = JoinSegments(line1_segments);
-    lines.line2 = JoinSegments(line2_segments);
     NormalizeDisplayLines(lines);
     return lines;
 }
 
 DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility) {
     DisplayLines lines{};
-    std::vector<std::wstring> line1_segments;
-    std::vector<std::wstring> line2_segments;
-
-    if (visibility.show_cpu) {
-        line1_segments.push_back(L"CPU 100%");
-    }
-    if (visibility.show_memory) {
-        line1_segments.push_back(L"MEM 100%");
-    }
+    AddOptionalPairColumn(
+        lines.columns, visibility.show_cpu, L"CPU 100%", visibility.show_memory, L"MEM 100%");
     if (visibility.show_gpu) {
-        line1_segments.push_back(L"GPU 100%");
+        AddColumn(lines.columns, L"GPU 100%");
     }
+    AddOptionalPairColumn(lines.columns,
+                          visibility.show_upload,
+                          L"\u2191 99.9GB/s",
+                          visibility.show_download,
+                          L"\u2193 99.9GB/s");
+    AddOptionalPairColumn(lines.columns,
+                          visibility.show_disk_read,
+                          L"R 99.9GB/s",
+                          visibility.show_disk_write,
+                          L"W 99.9GB/s");
 
-    if (visibility.show_upload) {
-        line2_segments.push_back(L"\u2191 99.9GB/s");
-    }
-    if (visibility.show_download) {
-        line2_segments.push_back(L"\u2193 99.9GB/s");
-    }
-    if (visibility.show_disk_read) {
-        line2_segments.push_back(L"R 99.9GB/s");
-    }
-    if (visibility.show_disk_write) {
-        line2_segments.push_back(L"W 99.9GB/s");
-    }
-
-    lines.line1 = JoinSegments(line1_segments);
-    lines.line2 = JoinSegments(line2_segments);
     NormalizeDisplayLines(lines);
     return lines;
 }
