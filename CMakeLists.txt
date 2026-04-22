@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(minimal_taskbar_monitor LANGUAGES CXX)
 
+include(CheckIPOSupported)
+
 find_program(POWERSHELL_EXECUTABLE NAMES powershell pwsh REQUIRED)
 
 set(APP_LOGO_PNG "${CMAKE_CURRENT_SOURCE_DIR}/logo.png")
@@ -65,3 +67,33 @@ target_link_libraries(minimal_taskbar_monitor PRIVATE
     gdiplus
     ole32
 )
+
+if(MSVC)
+    target_compile_options(minimal_taskbar_monitor PRIVATE
+        $<$<CONFIG:Release>:
+            /O2
+            /Oi
+            /Ot
+            /Oy
+            /GF
+            /Gy
+            /Gw
+            /fp:fast
+        >
+    )
+
+    target_link_options(minimal_taskbar_monitor PRIVATE
+        $<$<CONFIG:Release>:
+            /OPT:REF
+            /OPT:ICF
+            /INCREMENTAL:NO
+        >
+    )
+
+    check_ipo_supported(RESULT ipo_supported OUTPUT ipo_output)
+    if(ipo_supported)
+        set_property(TARGET minimal_taskbar_monitor PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    else()
+        message(WARNING "IPO/LTCG is not supported for this toolchain: ${ipo_output}")
+    endif()
+endif()
