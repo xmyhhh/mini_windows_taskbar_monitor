@@ -205,6 +205,25 @@ std::wstring FormatRate(unsigned long long bytes_per_second) {
     return buffer;
 }
 
+std::wstring FormatNetworkRate(unsigned long long bytes_per_second) {
+    double value = static_cast<double>(bytes_per_second) * 8.0;
+    const wchar_t* units[] = {L"bps", L"Kbps", L"Mbps", L"Gbps"};
+    size_t unit_index = 0;
+
+    while (value >= 1000.0 && unit_index + 1 < _countof(units)) {
+        value /= 1000.0;
+        ++unit_index;
+    }
+
+    wchar_t buffer[64]{};
+    if (value >= 100.0 || unit_index == 0) {
+        swprintf_s(buffer, L"%.0f%ls", value, units[unit_index]);
+    } else {
+        swprintf_s(buffer, L"%.1f%ls", value, units[unit_index]);
+    }
+    return buffer;
+}
+
 std::wstring FormatBytes(unsigned long long byte_count) {
     double value = static_cast<double>(byte_count);
     const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
@@ -1552,8 +1571,8 @@ private:
         draw_inline_segment(summary_line1_rect, proc_summary, palette.secondary_text);
 
         const std::wstring summary_line2 =
-            L"NET \u2191 " + FormatRate(last_snapshot_.upload_bytes_per_second) + L"   \u2193 " +
-            FormatRate(last_snapshot_.download_bytes_per_second) + L"   DISK R " +
+            L"NET \u2191 " + FormatNetworkRate(last_snapshot_.upload_bytes_per_second) + L"   \u2193 " +
+            FormatNetworkRate(last_snapshot_.download_bytes_per_second) + L"   DISK R " +
             FormatRate(last_snapshot_.disk_read_bytes_per_second) + L"   W " +
             FormatRate(last_snapshot_.disk_write_bytes_per_second);
         const std::wstring summary_line3 =
@@ -1742,7 +1761,7 @@ private:
                 const std::wstring io_text =
                     FormatRate(item.io_read_bytes_per_second + item.io_write_bytes_per_second);
                 const std::wstring net_text = hover_popup_snapshot_.network_metric_available
-                                                  ? FormatRate(item.network_bytes_per_second)
+                                                  ? FormatNetworkRate(item.network_bytes_per_second)
                                                   : L"--";
                 const COLORREF cpu_color =
                     ResolveAlertColor(palette,
@@ -1821,7 +1840,7 @@ private:
                   &footer_rect1,
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
         DrawTextW(dc,
-                  L"* VRAM shows dedicated GPU memory. NET is estimated from per-process IO-other activity on Windows.",
+                  L"* VRAM shows dedicated GPU memory. NET is shown in bit/s and estimated from IO-other activity.",
                   -1,
                   &footer_rect2,
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);

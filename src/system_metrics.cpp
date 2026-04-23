@@ -33,13 +33,33 @@ unsigned long long ToUnsignedLongLong(const FILETIME& value) {
     return combined.QuadPart;
 }
 
-std::wstring FormatSpeed(unsigned long long bytes_per_second) {
+std::wstring FormatByteRate(unsigned long long bytes_per_second) {
     double value = static_cast<double>(bytes_per_second);
     const wchar_t* units[] = {L"B/s", L"KB/s", L"MB/s", L"GB/s"};
     size_t unit_index = 0;
 
     while (value >= 1024.0 && unit_index + 1 < _countof(units)) {
         value /= 1024.0;
+        ++unit_index;
+    }
+
+    wchar_t buffer[64]{};
+    if (value >= 100.0 || unit_index == 0) {
+        swprintf_s(buffer, L"%.0f%ls", value, units[unit_index]);
+    } else {
+        swprintf_s(buffer, L"%.1f%ls", value, units[unit_index]);
+    }
+
+    return buffer;
+}
+
+std::wstring FormatNetworkRate(unsigned long long bytes_per_second) {
+    double value = static_cast<double>(bytes_per_second) * 8.0;
+    const wchar_t* units[] = {L"bps", L"Kbps", L"Mbps", L"Gbps"};
+    size_t unit_index = 0;
+
+    while (value >= 1000.0 && unit_index + 1 < _countof(units)) {
+        value /= 1000.0;
         ++unit_index;
     }
 
@@ -490,17 +510,17 @@ DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
     AddOptionalPairColumn(lines.columns,
                           visibility.show_upload,
                           std::wstring(L"\u2191 ") +
-                              FormatSpeed(snapshot.upload_bytes_per_second),
+                              FormatNetworkRate(snapshot.upload_bytes_per_second),
                           visibility.show_download,
                           std::wstring(L"\u2193 ") +
-                              FormatSpeed(snapshot.download_bytes_per_second));
+                              FormatNetworkRate(snapshot.download_bytes_per_second));
     AddOptionalPairColumn(lines.columns,
                           visibility.show_disk_read,
                           std::wstring(L"R ") +
-                              FormatSpeed(snapshot.disk_read_bytes_per_second),
+                              FormatByteRate(snapshot.disk_read_bytes_per_second),
                           visibility.show_disk_write,
                           std::wstring(L"W ") +
-                              FormatSpeed(snapshot.disk_write_bytes_per_second));
+                              FormatByteRate(snapshot.disk_write_bytes_per_second));
 
     NormalizeDisplayLines(lines);
     return lines;
@@ -515,9 +535,9 @@ DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility) {
     }
     AddOptionalPairColumn(lines.columns,
                           visibility.show_upload,
-                          L"\u2191 99.9GB/s",
+                          L"\u2191 999Mbps",
                           visibility.show_download,
-                          L"\u2193 99.9GB/s");
+                          L"\u2193 999Mbps");
     AddOptionalPairColumn(lines.columns,
                           visibility.show_disk_read,
                           L"R 99.9GB/s",
