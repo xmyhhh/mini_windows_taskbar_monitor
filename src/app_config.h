@@ -8,6 +8,7 @@ namespace minimal_taskbar_monitor {
 
 struct AppConfig {
     MetricVisibility visible_metrics{};
+    NetworkDisplayUnit network_display_unit{NetworkDisplayUnit::kBitsPerSecond};
 };
 
 AppConfig LoadAppConfig();

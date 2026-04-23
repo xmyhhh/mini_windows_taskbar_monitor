@@ -37,8 +37,63 @@ bool ReadBoolValue(const std::string& content, std::string_view key, bool defaul
     return default_value;
 }
 
+std::string ReadStringValue(const std::string& content,
+                            std::string_view key,
+                            std::string_view default_value) {
+    const std::string quoted_key = "\"" + std::string(key) + "\"";
+    const size_t key_pos = content.find(quoted_key);
+    if (key_pos == std::string::npos) {
+        return std::string(default_value);
+    }
+
+    size_t colon_pos = content.find(':', key_pos + quoted_key.size());
+    if (colon_pos == std::string::npos) {
+        return std::string(default_value);
+    }
+    ++colon_pos;
+
+    while (colon_pos < content.size() &&
+           (content[colon_pos] == ' ' || content[colon_pos] == '\t' || content[colon_pos] == '\r' ||
+            content[colon_pos] == '\n')) {
+        ++colon_pos;
+    }
+
+    if (colon_pos >= content.size() || content[colon_pos] != '"') {
+        return std::string(default_value);
+    }
+    ++colon_pos;
+
+    const size_t end_quote_pos = content.find('"', colon_pos);
+    if (end_quote_pos == std::string::npos) {
+        return std::string(default_value);
+    }
+
+    return content.substr(colon_pos, end_quote_pos - colon_pos);
+}
+
 std::string SerializeBool(const char* key, bool value) {
     return std::string("  \"") + key + "\": " + (value ? "true" : "false");
+}
+
+std::string SerializeString(const char* key, std::string_view value) {
+    return std::string("  \"") + key + "\": \"" + std::string(value) + "\"";
+}
+
+NetworkDisplayUnit ParseNetworkDisplayUnit(std::string_view value) {
+    if (value == "bytes") {
+        return NetworkDisplayUnit::kBytesPerSecond;
+    }
+    return NetworkDisplayUnit::kBitsPerSecond;
+}
+
+std::string_view SerializeNetworkDisplayUnit(NetworkDisplayUnit value) {
+    switch (value) {
+    case NetworkDisplayUnit::kBytesPerSecond:
+        return "bytes";
+    case NetworkDisplayUnit::kBitsPerSecond:
+    default:
+        return "bits";
+    }
 }
 
 }  // namespace
@@ -98,6 +153,8 @@ AppConfig LoadAppConfig() {
         ReadBoolValue(content, "show_disk_read", config.visible_metrics.show_disk_read);
     config.visible_metrics.show_disk_write =
         ReadBoolValue(content, "show_disk_write", config.visible_metrics.show_disk_write);
+    config.network_display_unit = ParseNetworkDisplayUnit(
+        ReadStringValue(content, "network_unit", "bits"));
     return config;
 }
 
@@ -120,7 +177,9 @@ bool SaveAppConfig(const AppConfig& config) {
     content += SerializeBool("show_download", config.visible_metrics.show_download) + ",\n";
     content += SerializeBool("show_gpu", config.visible_metrics.show_gpu) + ",\n";
     content += SerializeBool("show_disk_read", config.visible_metrics.show_disk_read) + ",\n";
-    content += SerializeBool("show_disk_write", config.visible_metrics.show_disk_write) + "\n";
+    content += SerializeBool("show_disk_write", config.visible_metrics.show_disk_write) + ",\n";
+    content += SerializeString("network_unit",
+                               SerializeNetworkDisplayUnit(config.network_display_unit)) + "\n";
     content += "}\n";
 
     HANDLE file_handle =

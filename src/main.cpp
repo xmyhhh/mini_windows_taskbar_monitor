@@ -38,6 +38,8 @@ constexpr UINT kTrayIconCallbackMessage = WM_APP + 1;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kExitCommandId = 1001;
 constexpr UINT kAutoStartCommandId = 1002;
+constexpr UINT kNetworkUnitsBitsCommandId = 1003;
+constexpr UINT kNetworkUnitsBytesCommandId = 1004;
 constexpr UINT kMetricCpuCommandId = 1101;
 constexpr UINT kMetricMemoryCommandId = 1102;
 constexpr UINT kMetricUploadCommandId = 1103;
@@ -205,23 +207,19 @@ std::wstring FormatRate(unsigned long long bytes_per_second) {
     return buffer;
 }
 
-std::wstring FormatNetworkRate(unsigned long long bytes_per_second) {
-    double value = static_cast<double>(bytes_per_second) * 8.0;
-    const wchar_t* units[] = {L"bps", L"Kbps", L"Mbps", L"Gbps"};
-    size_t unit_index = 0;
+std::wstring FormatNetworkRate(unsigned long long bytes_per_second,
+                               NetworkDisplayUnit network_display_unit) {
+    return FormatNetworkRateForDisplay(bytes_per_second, network_display_unit);
+}
 
-    while (value >= 1000.0 && unit_index + 1 < _countof(units)) {
-        value /= 1000.0;
-        ++unit_index;
+const wchar_t* GetNetworkUnitFooterText(NetworkDisplayUnit network_display_unit) {
+    switch (network_display_unit) {
+    case NetworkDisplayUnit::kBytesPerSecond:
+        return L"* VRAM shows dedicated GPU memory. NET is shown in B/s and estimated from IO-other activity.";
+    case NetworkDisplayUnit::kBitsPerSecond:
+    default:
+        return L"* VRAM shows dedicated GPU memory. NET is shown in bit/s and estimated from IO-other activity.";
     }
-
-    wchar_t buffer[64]{};
-    if (value >= 100.0 || unit_index == 0) {
-        swprintf_s(buffer, L"%.0f%ls", value, units[unit_index]);
-    } else {
-        swprintf_s(buffer, L"%.1f%ls", value, units[unit_index]);
-    }
-    return buffer;
 }
 
 std::wstring FormatBytes(unsigned long long byte_count) {
@@ -800,7 +798,8 @@ private:
         HFONT active_font =
             font_ != nullptr ? font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         HGDIOBJ old_font = SelectObject(screen_dc, active_font);
-        const DisplayLines sample_lines = GetMetricsSampleLines(app_config_.visible_metrics);
+        const DisplayLines sample_lines =
+            GetMetricsSampleLines(app_config_.visible_metrics, app_config_.network_display_unit);
         const int column_gap = ScaleByDpi(current_dpi_, 8);
         column_widths_ = MeasureColumnWidths(screen_dc, sample_lines.columns);
         TEXTMETRICW text_metrics{};
@@ -841,7 +840,8 @@ private:
     }
 
     void UpdateDisplayLines(const MetricsSnapshot& snapshot) {
-        const DisplayLines lines = FormatMetricsLines(snapshot, app_config_.visible_metrics);
+        const DisplayLines lines = FormatMetricsLines(
+            snapshot, app_config_.visible_metrics, app_config_.network_display_unit);
         line1_text_ = lines.line1;
         line2_text_ = lines.line2;
         display_columns_ = lines.columns;
@@ -1571,8 +1571,13 @@ private:
         draw_inline_segment(summary_line1_rect, proc_summary, palette.secondary_text);
 
         const std::wstring summary_line2 =
-            L"NET \u2191 " + FormatNetworkRate(last_snapshot_.upload_bytes_per_second) + L"   \u2193 " +
-            FormatNetworkRate(last_snapshot_.download_bytes_per_second) + L"   DISK R " +
+            L"NET \u2191 " +
+            FormatNetworkRate(last_snapshot_.upload_bytes_per_second,
+                              app_config_.network_display_unit) +
+            L"   \u2193 " +
+            FormatNetworkRate(last_snapshot_.download_bytes_per_second,
+                              app_config_.network_display_unit) +
+            L"   DISK R " +
             FormatRate(last_snapshot_.disk_read_bytes_per_second) + L"   W " +
             FormatRate(last_snapshot_.disk_write_bytes_per_second);
         const std::wstring summary_line3 =
@@ -1761,7 +1766,9 @@ private:
                 const std::wstring io_text =
                     FormatRate(item.io_read_bytes_per_second + item.io_write_bytes_per_second);
                 const std::wstring net_text = hover_popup_snapshot_.network_metric_available
-                                                  ? FormatNetworkRate(item.network_bytes_per_second)
+                                                  ? FormatNetworkRate(
+                                                        item.network_bytes_per_second,
+                                                        app_config_.network_display_unit)
                                                   : L"--";
                 const COLORREF cpu_color =
                     ResolveAlertColor(palette,
@@ -1840,7 +1847,7 @@ private:
                   &footer_rect1,
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
         DrawTextW(dc,
-                  L"* VRAM shows dedicated GPU memory. NET is shown in bit/s and estimated from IO-other activity.",
+                  GetNetworkUnitFooterText(app_config_.network_display_unit),
                   -1,
                   &footer_rect2,
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -2155,6 +2162,26 @@ private:
         return true;
     }
 
+    bool SetNetworkDisplayUnit(NetworkDisplayUnit network_display_unit) {
+        if (app_config_.network_display_unit == network_display_unit) {
+            return true;
+        }
+
+        const NetworkDisplayUnit previous_unit = app_config_.network_display_unit;
+        app_config_.network_display_unit = network_display_unit;
+        if (!SaveConfig()) {
+            app_config_.network_display_unit = previous_unit;
+            MessageBoxW(controller_window_,
+                        L"Unable to save the local config file.",
+                        L"Minimal Taskbar Monitor",
+                        MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        ApplyMetricVisibilityChange();
+        return true;
+    }
+
     void UpdateLayout() {
         if (!EnsureWidgetWindow()) {
             return;
@@ -2210,6 +2237,7 @@ private:
         HideHoverPopup();
         HMENU menu = CreatePopupMenu();
         HMENU metrics_menu = CreatePopupMenu();
+        HMENU network_units_menu = CreatePopupMenu();
         AppendMenuW(metrics_menu,
                     MF_STRING | (app_config_.visible_metrics.show_cpu ? MF_CHECKED : MF_UNCHECKED),
                     kMetricCpuCommandId,
@@ -2243,11 +2271,29 @@ private:
                         (app_config_.visible_metrics.show_disk_write ? MF_CHECKED : MF_UNCHECKED),
                     kMetricDiskWriteCommandId,
                     L"Disk Write");
+        AppendMenuW(network_units_menu,
+                    MF_STRING |
+                        (app_config_.network_display_unit == NetworkDisplayUnit::kBitsPerSecond
+                             ? MF_CHECKED
+                             : MF_UNCHECKED),
+                    kNetworkUnitsBitsCommandId,
+                    L"Bit rate (Kbps)");
+        AppendMenuW(network_units_menu,
+                    MF_STRING |
+                        (app_config_.network_display_unit == NetworkDisplayUnit::kBytesPerSecond
+                             ? MF_CHECKED
+                             : MF_UNCHECKED),
+                    kNetworkUnitsBytesCommandId,
+                    L"Byte rate (KB/s)");
 
         AppendMenuW(menu,
                     MF_POPUP,
                     reinterpret_cast<UINT_PTR>(metrics_menu),
                     L"Visible Metrics");
+        AppendMenuW(menu,
+                    MF_POPUP,
+                    reinterpret_cast<UINT_PTR>(network_units_menu),
+                    L"Network Units");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         const UINT auto_start_flags =
             MF_STRING | (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED);
@@ -2263,6 +2309,14 @@ private:
         PostMessageW(controller_window_, WM_NULL, 0, 0);
 
         if (ToggleMetricVisibility(command)) {
+            return;
+        }
+        if (command == kNetworkUnitsBitsCommandId) {
+            SetNetworkDisplayUnit(NetworkDisplayUnit::kBitsPerSecond);
+            return;
+        }
+        if (command == kNetworkUnitsBytesCommandId) {
+            SetNetworkDisplayUnit(NetworkDisplayUnit::kBytesPerSecond);
             return;
         }
         if (command == kAutoStartCommandId) {
@@ -2693,7 +2747,7 @@ private:
     int hover_popup_scroll_offset_{0};
     std::wstring hover_popup_search_text_{};
     std::wstring line1_text_{L"CPU 0%  MEM 0%"};
-    std::wstring line2_text_{L"\u2191 0B/s  \u2193 0B/s  R 0B/s  W 0B/s"};
+    std::wstring line2_text_{L"\u2191 0bps  \u2193 0bps  R 0B/s  W 0B/s"};
     std::vector<DisplayLines::Column> display_columns_{};
     std::vector<int> column_widths_{};
     ProcessMonitor process_monitor_{};

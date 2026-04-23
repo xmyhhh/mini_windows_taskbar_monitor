@@ -53,13 +53,33 @@ std::wstring FormatByteRate(unsigned long long bytes_per_second) {
     return buffer;
 }
 
-std::wstring FormatNetworkRate(unsigned long long bytes_per_second) {
+std::wstring FormatBitsPerSecondRate(unsigned long long bytes_per_second) {
     double value = static_cast<double>(bytes_per_second) * 8.0;
     const wchar_t* units[] = {L"bps", L"Kbps", L"Mbps", L"Gbps"};
     size_t unit_index = 0;
 
     while (value >= 1000.0 && unit_index + 1 < _countof(units)) {
         value /= 1000.0;
+        ++unit_index;
+    }
+
+    wchar_t buffer[64]{};
+    if (value >= 100.0 || unit_index == 0) {
+        swprintf_s(buffer, L"%.0f%ls", value, units[unit_index]);
+    } else {
+        swprintf_s(buffer, L"%.1f%ls", value, units[unit_index]);
+    }
+
+    return buffer;
+}
+
+std::wstring FormatBytesPerSecondRate(unsigned long long bytes_per_second) {
+    double value = static_cast<double>(bytes_per_second);
+    const wchar_t* units[] = {L"B/s", L"KB/s", L"MB/s", L"GB/s"};
+    size_t unit_index = 0;
+
+    while (value >= 1024.0 && unit_index + 1 < _countof(units)) {
+        value /= 1024.0;
         ++unit_index;
     }
 
@@ -177,6 +197,17 @@ void CloseQueryIfNeeded(PDH_HQUERY& query_handle) {
 }
 
 }  // namespace
+
+std::wstring FormatNetworkRateForDisplay(unsigned long long bytes_per_second,
+                                         NetworkDisplayUnit network_display_unit) {
+    switch (network_display_unit) {
+    case NetworkDisplayUnit::kBytesPerSecond:
+        return FormatBytesPerSecondRate(bytes_per_second);
+    case NetworkDisplayUnit::kBitsPerSecond:
+    default:
+        return FormatBitsPerSecondRate(bytes_per_second);
+    }
+}
 
 SystemMetrics::SystemMetrics() {
     InitializeCounterQuery(
@@ -488,7 +519,8 @@ bool SystemMetrics::QueryNetworkTotals(unsigned long long& total_in_bytes,
 }
 
 DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
-                                const MetricVisibility& visibility) {
+                                const MetricVisibility& visibility,
+                                NetworkDisplayUnit network_display_unit) {
     DisplayLines lines{};
     AddOptionalPairColumn(lines.columns,
                           visibility.show_cpu,
@@ -510,10 +542,12 @@ DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
     AddOptionalPairColumn(lines.columns,
                           visibility.show_upload,
                           std::wstring(L"\u2191 ") +
-                              FormatNetworkRate(snapshot.upload_bytes_per_second),
+                              FormatNetworkRateForDisplay(snapshot.upload_bytes_per_second,
+                                                          network_display_unit),
                           visibility.show_download,
                           std::wstring(L"\u2193 ") +
-                              FormatNetworkRate(snapshot.download_bytes_per_second));
+                              FormatNetworkRateForDisplay(snapshot.download_bytes_per_second,
+                                                          network_display_unit));
     AddOptionalPairColumn(lines.columns,
                           visibility.show_disk_read,
                           std::wstring(L"R ") +
@@ -526,7 +560,8 @@ DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
     return lines;
 }
 
-DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility) {
+DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility,
+                                   NetworkDisplayUnit network_display_unit) {
     DisplayLines lines{};
     AddOptionalPairColumn(
         lines.columns, visibility.show_cpu, L"CPU 100%", visibility.show_memory, L"MEM 100%");
@@ -535,9 +570,13 @@ DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility) {
     }
     AddOptionalPairColumn(lines.columns,
                           visibility.show_upload,
-                          L"\u2191 999Mbps",
+                          network_display_unit == NetworkDisplayUnit::kBytesPerSecond
+                              ? L"\u2191 999MB/s"
+                              : L"\u2191 999Mbps",
                           visibility.show_download,
-                          L"\u2193 999Mbps");
+                          network_display_unit == NetworkDisplayUnit::kBytesPerSecond
+                              ? L"\u2193 999MB/s"
+                              : L"\u2193 999Mbps");
     AddOptionalPairColumn(lines.columns,
                           visibility.show_disk_read,
                           L"R 99.9GB/s",

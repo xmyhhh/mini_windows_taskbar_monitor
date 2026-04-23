@@ -8,6 +8,11 @@
 
 namespace minimal_taskbar_monitor {
 
+enum class NetworkDisplayUnit {
+    kBitsPerSecond,
+    kBytesPerSecond,
+};
+
 struct MetricsSnapshot {
     int cpu_percent{-1};
     int memory_percent{-1};
@@ -93,8 +98,12 @@ private:
 };
 
 DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
-                                const MetricVisibility& visibility);
-DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility);
+                                const MetricVisibility& visibility,
+                                NetworkDisplayUnit network_display_unit);
+DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility,
+                                   NetworkDisplayUnit network_display_unit);
+std::wstring FormatNetworkRateForDisplay(unsigned long long bytes_per_second,
+                                         NetworkDisplayUnit network_display_unit);
 bool IsLightTaskbarTheme();
 
 }  // namespace minimal_taskbar_monitor
