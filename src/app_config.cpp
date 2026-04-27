@@ -96,6 +96,23 @@ std::string_view SerializeNetworkDisplayUnit(NetworkDisplayUnit value) {
     }
 }
 
+PopupActivationMode ParsePopupActivationMode(std::string_view value) {
+    if (value == "click") {
+        return PopupActivationMode::kClick;
+    }
+    return PopupActivationMode::kHover;
+}
+
+std::string_view SerializePopupActivationMode(PopupActivationMode value) {
+    switch (value) {
+    case PopupActivationMode::kClick:
+        return "click";
+    case PopupActivationMode::kHover:
+    default:
+        return "hover";
+    }
+}
+
 }  // namespace
 
 std::wstring GetAppConfigPath() {
@@ -155,6 +172,8 @@ AppConfig LoadAppConfig() {
         ReadBoolValue(content, "show_disk_write", config.visible_metrics.show_disk_write);
     config.network_display_unit = ParseNetworkDisplayUnit(
         ReadStringValue(content, "network_unit", "bits"));
+    config.popup_activation_mode = ParsePopupActivationMode(
+        ReadStringValue(content, "popup_activation_mode", "hover"));
     return config;
 }
 
@@ -179,7 +198,9 @@ bool SaveAppConfig(const AppConfig& config) {
     content += SerializeBool("show_disk_read", config.visible_metrics.show_disk_read) + ",\n";
     content += SerializeBool("show_disk_write", config.visible_metrics.show_disk_write) + ",\n";
     content += SerializeString("network_unit",
-                               SerializeNetworkDisplayUnit(config.network_display_unit)) + "\n";
+                               SerializeNetworkDisplayUnit(config.network_display_unit)) + ",\n";
+    content += SerializeString("popup_activation_mode",
+                               SerializePopupActivationMode(config.popup_activation_mode)) + "\n";
     content += "}\n";
 
     HANDLE file_handle =

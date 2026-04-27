@@ -40,6 +40,8 @@ constexpr UINT kExitCommandId = 1001;
 constexpr UINT kAutoStartCommandId = 1002;
 constexpr UINT kNetworkUnitsBitsCommandId = 1003;
 constexpr UINT kNetworkUnitsBytesCommandId = 1004;
+constexpr UINT kPopupModeHoverCommandId = 1005;
+constexpr UINT kPopupModeClickCommandId = 1006;
 constexpr UINT kMetricCpuCommandId = 1101;
 constexpr UINT kMetricMemoryCommandId = 1102;
 constexpr UINT kMetricUploadCommandId = 1103;
@@ -1953,7 +1955,7 @@ private:
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 
-    void ShowHoverPopup() {
+    void ShowHoverPopup(bool activate) {
         if (!EnsureHoverPopupWindow()) {
             return;
         }
@@ -1961,10 +1963,15 @@ private:
         KillTimer(controller_window_, kHoverHideTimerId);
         RefreshHoverPopupData();
         PositionHoverPopup();
-        ShowWindow(hover_popup_window_, SW_SHOWNOACTIVATE);
+        ShowWindow(hover_popup_window_, activate ? SW_SHOW : SW_SHOWNOACTIVATE);
         hover_popup_visible_ = true;
         UpdateHoverPopupScrollBar();
         RequestHoverPopupRedraw();
+        if (activate) {
+            SetForegroundWindow(hover_popup_window_);
+            SetActiveWindow(hover_popup_window_);
+            SetFocus(hover_popup_window_);
+        }
     }
 
     void HideHoverPopup() {
@@ -1977,6 +1984,9 @@ private:
     }
 
     void ArmHoverHideTimer() {
+        if (app_config_.popup_activation_mode != PopupActivationMode::kHover) {
+            return;
+        }
         if (controller_window_ == nullptr || !IsWindow(controller_window_)) {
             return;
         }
@@ -1984,6 +1994,9 @@ private:
     }
 
     void HandleHoverMove(HWND source_window) {
+        if (app_config_.popup_activation_mode != PopupActivationMode::kHover) {
+            return;
+        }
         TRACKMOUSEEVENT track_event{};
         track_event.cbSize = sizeof(track_event);
         track_event.dwFlags = TME_LEAVE;
@@ -1992,7 +2005,7 @@ private:
 
         KillTimer(controller_window_, kHoverHideTimerId);
         if (!hover_popup_visible_) {
-            ShowHoverPopup();
+            ShowHoverPopup(false);
         }
     }
 
@@ -2182,6 +2195,50 @@ private:
         return true;
     }
 
+    bool SetPopupActivationMode(PopupActivationMode popup_activation_mode) {
+        if (app_config_.popup_activation_mode == popup_activation_mode) {
+            return true;
+        }
+
+        const PopupActivationMode previous_mode = app_config_.popup_activation_mode;
+        app_config_.popup_activation_mode = popup_activation_mode;
+        if (!SaveConfig()) {
+            app_config_.popup_activation_mode = previous_mode;
+            MessageBoxW(controller_window_,
+                        L"Unable to save the local config file.",
+                        L"Minimal Taskbar Monitor",
+                        MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        HideHoverPopup();
+        return true;
+    }
+
+    void HandleWidgetLeftButtonDown() {
+        click_popup_started_from_widget_ =
+            app_config_.popup_activation_mode == PopupActivationMode::kClick && hover_popup_visible_;
+    }
+
+    void HandleWidgetLeftButtonUp() {
+        if (app_config_.popup_activation_mode != PopupActivationMode::kClick) {
+            click_popup_started_from_widget_ = false;
+            return;
+        }
+
+        if (click_popup_started_from_widget_) {
+            click_popup_started_from_widget_ = false;
+            return;
+        }
+
+        if (hover_popup_visible_) {
+            HideHoverPopup();
+            return;
+        }
+
+        ShowHoverPopup(true);
+    }
+
     void UpdateLayout() {
         if (!EnsureWidgetWindow()) {
             return;
@@ -2238,6 +2295,7 @@ private:
         HMENU menu = CreatePopupMenu();
         HMENU metrics_menu = CreatePopupMenu();
         HMENU network_units_menu = CreatePopupMenu();
+        HMENU popup_mode_menu = CreatePopupMenu();
         AppendMenuW(metrics_menu,
                     MF_STRING | (app_config_.visible_metrics.show_cpu ? MF_CHECKED : MF_UNCHECKED),
                     kMetricCpuCommandId,
@@ -2277,14 +2335,28 @@ private:
                              ? MF_CHECKED
                              : MF_UNCHECKED),
                     kNetworkUnitsBitsCommandId,
-                    L"Bit rate (Kbps)");
+                    L"Bits/sec (Task Manager style)");
         AppendMenuW(network_units_menu,
                     MF_STRING |
                         (app_config_.network_display_unit == NetworkDisplayUnit::kBytesPerSecond
                              ? MF_CHECKED
                              : MF_UNCHECKED),
                     kNetworkUnitsBytesCommandId,
-                    L"Byte rate (KB/s)");
+                    L"Bytes/sec (KB/s, MB/s)");
+        AppendMenuW(popup_mode_menu,
+                    MF_STRING |
+                        (app_config_.popup_activation_mode == PopupActivationMode::kHover
+                             ? MF_CHECKED
+                             : MF_UNCHECKED),
+                    kPopupModeHoverCommandId,
+                    L"Hover popup");
+        AppendMenuW(popup_mode_menu,
+                    MF_STRING |
+                        (app_config_.popup_activation_mode == PopupActivationMode::kClick
+                             ? MF_CHECKED
+                             : MF_UNCHECKED),
+                    kPopupModeClickCommandId,
+                    L"Click popup");
 
         AppendMenuW(menu,
                     MF_POPUP,
@@ -2294,6 +2366,10 @@ private:
                     MF_POPUP,
                     reinterpret_cast<UINT_PTR>(network_units_menu),
                     L"Network Units");
+        AppendMenuW(menu,
+                    MF_POPUP,
+                    reinterpret_cast<UINT_PTR>(popup_mode_menu),
+                    L"Popup Mode");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         const UINT auto_start_flags =
             MF_STRING | (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED);
@@ -2317,6 +2393,14 @@ private:
         }
         if (command == kNetworkUnitsBytesCommandId) {
             SetNetworkDisplayUnit(NetworkDisplayUnit::kBytesPerSecond);
+            return;
+        }
+        if (command == kPopupModeHoverCommandId) {
+            SetPopupActivationMode(PopupActivationMode::kHover);
+            return;
+        }
+        if (command == kPopupModeClickCommandId) {
+            SetPopupActivationMode(PopupActivationMode::kClick);
             return;
         }
         if (command == kAutoStartCommandId) {
@@ -2594,6 +2678,12 @@ private:
         case WM_MOUSELEAVE:
             app->ArmHoverHideTimer();
             return 0;
+        case WM_LBUTTONDOWN:
+            app->HandleWidgetLeftButtonDown();
+            return 0;
+        case WM_LBUTTONUP:
+            app->HandleWidgetLeftButtonUp();
+            return 0;
         case WM_RBUTTONUP: {
             POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
             ClientToScreen(window_handle, &point);
@@ -2679,7 +2769,11 @@ private:
             break;
         case WM_KILLFOCUS:
             app->SetHoverPopupSearchActive(false);
-            app->ArmHoverHideTimer();
+            if (app->app_config_.popup_activation_mode == PopupActivationMode::kClick) {
+                app->HideHoverPopup();
+            } else {
+                app->ArmHoverHideTimer();
+            }
             return 0;
         case WM_LBUTTONUP: {
             POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
@@ -2735,6 +2829,7 @@ private:
     bool is_shutting_down_{false};
     bool hover_popup_visible_{false};
     bool hover_popup_search_active_{false};
+    bool click_popup_started_from_widget_{false};
     bool tray_icon_added_{false};
     HICON tray_icon_handle_{nullptr};
     ULONG_PTR gdiplus_token_{0};

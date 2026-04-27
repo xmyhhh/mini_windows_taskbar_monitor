@@ -1,5 +1,7 @@
 #include "system_metrics.h"
 
+#include <ws2def.h>
+#include <ws2ipdef.h>
 #include <iphlpapi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
@@ -11,6 +13,7 @@
 #include <cwchar>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace minimal_taskbar_monitor {
@@ -194,6 +197,24 @@ void CloseQueryIfNeeded(PDH_HQUERY& query_handle) {
         PdhCloseQuery(query_handle);
         query_handle = nullptr;
     }
+}
+
+bool ShouldIncludeNetworkInterface(const MIB_IF_ROW2& row) {
+    if (row.Type == IF_TYPE_SOFTWARE_LOOPBACK || row.Type == IF_TYPE_TUNNEL) {
+        return false;
+    }
+    return row.OperStatus == IfOperStatusUp;
+}
+
+bool IsHardwareNetworkInterface(const MIB_IF_ROW2& row) {
+    return row.InterfaceAndOperStatusFlags.HardwareInterface != 0;
+}
+
+unsigned long long GetNetworkInterfaceKey(const MIB_IF_ROW2& row) {
+    if (row.InterfaceLuid.Value != 0) {
+        return row.InterfaceLuid.Value;
+    }
+    return row.InterfaceIndex;
 }
 
 }  // namespace
@@ -426,9 +447,8 @@ int SystemMetrics::SampleGpuPercent() {
 
 void SystemMetrics::SampleNetwork(unsigned long long& download_bytes_per_second,
                                   unsigned long long& upload_bytes_per_second) {
-    unsigned long long total_in_bytes = 0;
-    unsigned long long total_out_bytes = 0;
-    if (!QueryNetworkTotals(total_in_bytes, total_out_bytes)) {
+    NetworkInterfaceCounters current_interfaces;
+    if (!QueryNetworkInterfaces(current_interfaces)) {
         download_bytes_per_second = 0;
         upload_bytes_per_second = 0;
         return;
@@ -436,8 +456,7 @@ void SystemMetrics::SampleNetwork(unsigned long long& download_bytes_per_second,
 
     const ULONGLONG now = GetTickCount64();
     if (!network_initialized_) {
-        last_total_in_bytes_ = total_in_bytes;
-        last_total_out_bytes_ = total_out_bytes;
+        last_network_interfaces_ = std::move(current_interfaces);
         last_network_tick_ = now;
         network_initialized_ = true;
         download_bytes_per_second = 0;
@@ -452,14 +471,27 @@ void SystemMetrics::SampleNetwork(unsigned long long& download_bytes_per_second,
         return;
     }
 
-    const unsigned long long in_delta = total_in_bytes - last_total_in_bytes_;
-    const unsigned long long out_delta = total_out_bytes - last_total_out_bytes_;
+    unsigned long long in_delta = 0;
+    unsigned long long out_delta = 0;
+    for (const auto& [interface_key, current_totals] : current_interfaces) {
+        const auto previous_iterator = last_network_interfaces_.find(interface_key);
+        if (previous_iterator == last_network_interfaces_.end()) {
+            continue;
+        }
+
+        const NetworkInterfaceTotals& previous_totals = previous_iterator->second;
+        if (current_totals.in_bytes >= previous_totals.in_bytes) {
+            in_delta += current_totals.in_bytes - previous_totals.in_bytes;
+        }
+        if (current_totals.out_bytes >= previous_totals.out_bytes) {
+            out_delta += current_totals.out_bytes - previous_totals.out_bytes;
+        }
+    }
 
     download_bytes_per_second = (in_delta * 1000ULL) / elapsed_ms;
     upload_bytes_per_second = (out_delta * 1000ULL) / elapsed_ms;
 
-    last_total_in_bytes_ = total_in_bytes;
-    last_total_out_bytes_ = total_out_bytes;
+    last_network_interfaces_ = std::move(current_interfaces);
     last_network_tick_ = now;
 }
 
@@ -486,35 +518,35 @@ void SystemMetrics::SampleDisk(unsigned long long& read_bytes_per_second,
     }
 }
 
-bool SystemMetrics::QueryNetworkTotals(unsigned long long& total_in_bytes,
-                                       unsigned long long& total_out_bytes) const {
-    total_in_bytes = 0;
-    total_out_bytes = 0;
+bool SystemMetrics::QueryNetworkInterfaces(NetworkInterfaceCounters& interfaces) const {
+    interfaces.clear();
 
-    ULONG buffer_size = 0;
-    if (GetIfTable(nullptr, &buffer_size, FALSE) != ERROR_INSUFFICIENT_BUFFER || buffer_size == 0) {
+    MIB_IF_TABLE2* interface_table = nullptr;
+    if (GetIfTable2(&interface_table) != NO_ERROR || interface_table == nullptr) {
         return false;
     }
 
-    std::vector<BYTE> buffer(buffer_size);
-    auto* interface_table = reinterpret_cast<MIB_IFTABLE*>(buffer.data());
-    if (GetIfTable(interface_table, &buffer_size, FALSE) != NO_ERROR) {
-        return false;
+    bool has_hardware_interface = false;
+    for (ULONG i = 0; i < interface_table->NumEntries; ++i) {
+        const MIB_IF_ROW2& row = interface_table->Table[i];
+        if (ShouldIncludeNetworkInterface(row) && IsHardwareNetworkInterface(row)) {
+            has_hardware_interface = true;
+            break;
+        }
     }
 
-    for (DWORD i = 0; i < interface_table->dwNumEntries; ++i) {
-        const MIB_IFROW& row = interface_table->table[i];
-        if (row.dwType == IF_TYPE_SOFTWARE_LOOPBACK || row.dwType == IF_TYPE_TUNNEL) {
+    for (ULONG i = 0; i < interface_table->NumEntries; ++i) {
+        const MIB_IF_ROW2& row = interface_table->Table[i];
+        if (!ShouldIncludeNetworkInterface(row) ||
+            (has_hardware_interface && !IsHardwareNetworkInterface(row))) {
             continue;
         }
-        if (row.dwOperStatus != IF_OPER_STATUS_OPERATIONAL &&
-            row.dwOperStatus != IF_OPER_STATUS_CONNECTED) {
-            continue;
-        }
-        total_in_bytes += row.dwInOctets;
-        total_out_bytes += row.dwOutOctets;
+        NetworkInterfaceTotals& totals = interfaces[GetNetworkInterfaceKey(row)];
+        totals.in_bytes += row.InOctets;
+        totals.out_bytes += row.OutOctets;
     }
 
+    FreeMibTable(interface_table);
     return true;
 }
 

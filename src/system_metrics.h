@@ -3,6 +3,7 @@
 #include <pdh.h>
 #include <windows.h>
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,12 @@ public:
     MetricsSnapshot Sample();
 
 private:
+    struct NetworkInterfaceTotals {
+        unsigned long long in_bytes{0};
+        unsigned long long out_bytes{0};
+    };
+    using NetworkInterfaceCounters = std::map<unsigned long long, NetworkInterfaceTotals>;
+
     int SampleCpuPercent();
     int SampleCpuPercentWithSystemTimesFallback();
     int SampleMemoryPercent() const;
@@ -60,8 +67,7 @@ private:
     void SampleDisk(unsigned long long& read_bytes_per_second,
                     unsigned long long& write_bytes_per_second);
 
-    bool QueryNetworkTotals(unsigned long long& total_in_bytes,
-                            unsigned long long& total_out_bytes) const;
+    bool QueryNetworkInterfaces(NetworkInterfaceCounters& interfaces) const;
     bool InitializeCounterQuery(PDH_HQUERY& query_handle,
                                 bool& initialized,
                                 const wchar_t* primary_counter_path,
@@ -79,8 +85,7 @@ private:
     ULARGE_INTEGER last_user_time_{};
 
     bool network_initialized_{false};
-    unsigned long long last_total_in_bytes_{0};
-    unsigned long long last_total_out_bytes_{0};
+    NetworkInterfaceCounters last_network_interfaces_{};
     ULONGLONG last_network_tick_{0};
 
     PDH_HQUERY cpu_query_{nullptr};
