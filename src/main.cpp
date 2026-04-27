@@ -30,7 +30,6 @@ constexpr UINT_PTR kSampleTimerId = 1;
 constexpr UINT_PTR kLayoutTimerId = 2;
 constexpr UINT_PTR kReattachTimerId = 3;
 constexpr UINT_PTR kHoverHideTimerId = 4;
-constexpr UINT kSampleIntervalMs = 1000;
 constexpr UINT kLayoutIntervalMs = 1000;
 constexpr UINT kReattachDelayMs = 600;
 constexpr UINT kHoverHideDelayMs = 180;
@@ -42,6 +41,10 @@ constexpr UINT kNetworkUnitsBitsCommandId = 1003;
 constexpr UINT kNetworkUnitsBytesCommandId = 1004;
 constexpr UINT kPopupModeHoverCommandId = 1005;
 constexpr UINT kPopupModeClickCommandId = 1006;
+constexpr UINT kSampleInterval1sCommandId = 1007;
+constexpr UINT kSampleInterval2sCommandId = 1008;
+constexpr UINT kSampleInterval5sCommandId = 1009;
+constexpr UINT kSampleInterval10sCommandId = 1010;
 constexpr UINT kMetricCpuCommandId = 1101;
 constexpr UINT kMetricMemoryCommandId = 1102;
 constexpr UINT kMetricUploadCommandId = 1103;
@@ -53,6 +56,17 @@ constexpr wchar_t kRunRegistryPath[] = L"Software\\Microsoft\\Windows\\CurrentVe
 constexpr wchar_t kRunValueName[] = L"MinimalTaskbarMonitor";
 constexpr int kHoverPopupMaxVisibleRows = 14;
 constexpr int kHoverPopupWheelRows = 3;
+
+bool IsSupportedSampleIntervalSeconds(unsigned int seconds) {
+    return seconds == 1 || seconds == 2 || seconds == 5 || seconds == 10;
+}
+
+UINT GetSampleTimerIntervalMs(unsigned int seconds) {
+    if (!IsSupportedSampleIntervalSeconds(seconds)) {
+        seconds = 1;
+    }
+    return seconds * 1000u;
+}
 
 struct WidgetPalette {
     COLORREF background;
@@ -627,7 +641,10 @@ private:
         ReattachWidget();
         EnsureTrayIcon();
 
-        SetTimer(controller_window_, kSampleTimerId, kSampleIntervalMs, nullptr);
+        SetTimer(controller_window_,
+                 kSampleTimerId,
+                 GetSampleTimerIntervalMs(app_config_.sample_interval_seconds),
+                 nullptr);
         SetTimer(controller_window_, kLayoutTimerId, kLayoutIntervalMs, nullptr);
         return true;
     }
@@ -2215,6 +2232,33 @@ private:
         return true;
     }
 
+    bool SetSampleIntervalSeconds(unsigned int sample_interval_seconds) {
+        if (!IsSupportedSampleIntervalSeconds(sample_interval_seconds)) {
+            sample_interval_seconds = 1;
+        }
+        if (app_config_.sample_interval_seconds == sample_interval_seconds) {
+            return true;
+        }
+
+        const unsigned int previous_interval = app_config_.sample_interval_seconds;
+        app_config_.sample_interval_seconds = sample_interval_seconds;
+        if (!SaveConfig()) {
+            app_config_.sample_interval_seconds = previous_interval;
+            MessageBoxW(controller_window_,
+                        L"Unable to save the local config file.",
+                        L"Minimal Taskbar Monitor",
+                        MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        SetTimer(controller_window_,
+                 kSampleTimerId,
+                 GetSampleTimerIntervalMs(app_config_.sample_interval_seconds),
+                 nullptr);
+        SampleAndRefresh();
+        return true;
+    }
+
     void HandleWidgetLeftButtonDown() {
         click_popup_started_from_widget_ =
             app_config_.popup_activation_mode == PopupActivationMode::kClick && hover_popup_visible_;
@@ -2296,6 +2340,7 @@ private:
         HMENU metrics_menu = CreatePopupMenu();
         HMENU network_units_menu = CreatePopupMenu();
         HMENU popup_mode_menu = CreatePopupMenu();
+        HMENU refresh_interval_menu = CreatePopupMenu();
         AppendMenuW(metrics_menu,
                     MF_STRING | (app_config_.visible_metrics.show_cpu ? MF_CHECKED : MF_UNCHECKED),
                     kMetricCpuCommandId,
@@ -2357,6 +2402,26 @@ private:
                              : MF_UNCHECKED),
                     kPopupModeClickCommandId,
                     L"Click popup");
+        AppendMenuW(refresh_interval_menu,
+                    MF_STRING |
+                        (app_config_.sample_interval_seconds == 1 ? MF_CHECKED : MF_UNCHECKED),
+                    kSampleInterval1sCommandId,
+                    L"1 second");
+        AppendMenuW(refresh_interval_menu,
+                    MF_STRING |
+                        (app_config_.sample_interval_seconds == 2 ? MF_CHECKED : MF_UNCHECKED),
+                    kSampleInterval2sCommandId,
+                    L"2 seconds");
+        AppendMenuW(refresh_interval_menu,
+                    MF_STRING |
+                        (app_config_.sample_interval_seconds == 5 ? MF_CHECKED : MF_UNCHECKED),
+                    kSampleInterval5sCommandId,
+                    L"5 seconds");
+        AppendMenuW(refresh_interval_menu,
+                    MF_STRING |
+                        (app_config_.sample_interval_seconds == 10 ? MF_CHECKED : MF_UNCHECKED),
+                    kSampleInterval10sCommandId,
+                    L"10 seconds");
 
         AppendMenuW(menu,
                     MF_POPUP,
@@ -2370,6 +2435,10 @@ private:
                     MF_POPUP,
                     reinterpret_cast<UINT_PTR>(popup_mode_menu),
                     L"Popup Mode");
+        AppendMenuW(menu,
+                    MF_POPUP,
+                    reinterpret_cast<UINT_PTR>(refresh_interval_menu),
+                    L"Refresh Interval");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         const UINT auto_start_flags =
             MF_STRING | (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED);
@@ -2401,6 +2470,22 @@ private:
         }
         if (command == kPopupModeClickCommandId) {
             SetPopupActivationMode(PopupActivationMode::kClick);
+            return;
+        }
+        if (command == kSampleInterval1sCommandId) {
+            SetSampleIntervalSeconds(1);
+            return;
+        }
+        if (command == kSampleInterval2sCommandId) {
+            SetSampleIntervalSeconds(2);
+            return;
+        }
+        if (command == kSampleInterval5sCommandId) {
+            SetSampleIntervalSeconds(5);
+            return;
+        }
+        if (command == kSampleInterval10sCommandId) {
+            SetSampleIntervalSeconds(10);
             return;
         }
         if (command == kAutoStartCommandId) {

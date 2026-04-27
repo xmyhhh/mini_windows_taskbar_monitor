@@ -37,6 +37,38 @@ bool ReadBoolValue(const std::string& content, std::string_view key, bool defaul
     return default_value;
 }
 
+unsigned int ReadUnsignedIntValue(const std::string& content,
+                                  std::string_view key,
+                                  unsigned int default_value) {
+    const std::string quoted_key = "\"" + std::string(key) + "\"";
+    const size_t key_pos = content.find(quoted_key);
+    if (key_pos == std::string::npos) {
+        return default_value;
+    }
+
+    size_t colon_pos = content.find(':', key_pos + quoted_key.size());
+    if (colon_pos == std::string::npos) {
+        return default_value;
+    }
+    ++colon_pos;
+
+    while (colon_pos < content.size() &&
+           (content[colon_pos] == ' ' || content[colon_pos] == '\t' || content[colon_pos] == '\r' ||
+            content[colon_pos] == '\n')) {
+        ++colon_pos;
+    }
+
+    unsigned int value = 0;
+    bool has_digit = false;
+    while (colon_pos < content.size() && content[colon_pos] >= '0' && content[colon_pos] <= '9') {
+        has_digit = true;
+        value = value * 10u + static_cast<unsigned int>(content[colon_pos] - '0');
+        ++colon_pos;
+    }
+
+    return has_digit ? value : default_value;
+}
+
 std::string ReadStringValue(const std::string& content,
                             std::string_view key,
                             std::string_view default_value) {
@@ -75,8 +107,24 @@ std::string SerializeBool(const char* key, bool value) {
     return std::string("  \"") + key + "\": " + (value ? "true" : "false");
 }
 
+std::string SerializeUnsignedInt(const char* key, unsigned int value) {
+    return std::string("  \"") + key + "\": " + std::to_string(value);
+}
+
 std::string SerializeString(const char* key, std::string_view value) {
     return std::string("  \"") + key + "\": \"" + std::string(value) + "\"";
+}
+
+unsigned int NormalizeSampleIntervalSeconds(unsigned int value) {
+    switch (value) {
+    case 1:
+    case 2:
+    case 5:
+    case 10:
+        return value;
+    default:
+        return 1;
+    }
 }
 
 NetworkDisplayUnit ParseNetworkDisplayUnit(std::string_view value) {
@@ -174,6 +222,8 @@ AppConfig LoadAppConfig() {
         ReadStringValue(content, "network_unit", "bits"));
     config.popup_activation_mode = ParsePopupActivationMode(
         ReadStringValue(content, "popup_activation_mode", "hover"));
+    config.sample_interval_seconds = NormalizeSampleIntervalSeconds(
+        ReadUnsignedIntValue(content, "sample_interval_seconds", config.sample_interval_seconds));
     return config;
 }
 
@@ -200,7 +250,10 @@ bool SaveAppConfig(const AppConfig& config) {
     content += SerializeString("network_unit",
                                SerializeNetworkDisplayUnit(config.network_display_unit)) + ",\n";
     content += SerializeString("popup_activation_mode",
-                               SerializePopupActivationMode(config.popup_activation_mode)) + "\n";
+                               SerializePopupActivationMode(config.popup_activation_mode)) + ",\n";
+    content += SerializeUnsignedInt("sample_interval_seconds",
+                                    NormalizeSampleIntervalSeconds(
+                                        config.sample_interval_seconds)) + "\n";
     content += "}\n";
 
     HANDLE file_handle =
