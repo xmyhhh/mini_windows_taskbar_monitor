@@ -104,9 +104,11 @@ private:
 
 DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
                                 const MetricVisibility& visibility,
-                                NetworkDisplayUnit network_display_unit);
+                                NetworkDisplayUnit network_display_unit,
+                                bool use_chinese_labels = false);
 DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility,
-                                   NetworkDisplayUnit network_display_unit);
+                                   NetworkDisplayUnit network_display_unit,
+                                   bool use_chinese_labels = false);
 std::wstring FormatNetworkRateForDisplay(unsigned long long bytes_per_second,
                                          NetworkDisplayUnit network_display_unit);
 bool IsLightTaskbarTheme();

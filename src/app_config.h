@@ -11,11 +11,18 @@ enum class PopupActivationMode {
     kClick,
 };
 
+enum class UiLanguage {
+    kEnglish,
+    kChinese,
+};
+
 struct AppConfig {
     MetricVisibility visible_metrics{};
     NetworkDisplayUnit network_display_unit{NetworkDisplayUnit::kBitsPerSecond};
     PopupActivationMode popup_activation_mode{PopupActivationMode::kHover};
+    UiLanguage language{UiLanguage::kEnglish};
     unsigned int sample_interval_seconds{1};
+    unsigned int taskbar_monitor_index{0};
 };
 
 AppConfig LoadAppConfig();

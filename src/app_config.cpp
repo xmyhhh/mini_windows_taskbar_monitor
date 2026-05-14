@@ -161,6 +161,23 @@ std::string_view SerializePopupActivationMode(PopupActivationMode value) {
     }
 }
 
+UiLanguage ParseUiLanguage(std::string_view value) {
+    if (value == "zh_cn") {
+        return UiLanguage::kChinese;
+    }
+    return UiLanguage::kEnglish;
+}
+
+std::string_view SerializeUiLanguage(UiLanguage value) {
+    switch (value) {
+    case UiLanguage::kChinese:
+        return "zh_cn";
+    case UiLanguage::kEnglish:
+    default:
+        return "en";
+    }
+}
+
 }  // namespace
 
 std::wstring GetAppConfigPath() {
@@ -222,8 +239,11 @@ AppConfig LoadAppConfig() {
         ReadStringValue(content, "network_unit", "bits"));
     config.popup_activation_mode = ParsePopupActivationMode(
         ReadStringValue(content, "popup_activation_mode", "hover"));
+    config.language = ParseUiLanguage(ReadStringValue(content, "language", "en"));
     config.sample_interval_seconds = NormalizeSampleIntervalSeconds(
         ReadUnsignedIntValue(content, "sample_interval_seconds", config.sample_interval_seconds));
+    config.taskbar_monitor_index =
+        ReadUnsignedIntValue(content, "taskbar_monitor_index", config.taskbar_monitor_index);
     return config;
 }
 
@@ -251,9 +271,11 @@ bool SaveAppConfig(const AppConfig& config) {
                                SerializeNetworkDisplayUnit(config.network_display_unit)) + ",\n";
     content += SerializeString("popup_activation_mode",
                                SerializePopupActivationMode(config.popup_activation_mode)) + ",\n";
+    content += SerializeString("language", SerializeUiLanguage(config.language)) + ",\n";
     content += SerializeUnsignedInt("sample_interval_seconds",
                                     NormalizeSampleIntervalSeconds(
-                                        config.sample_interval_seconds)) + "\n";
+                                        config.sample_interval_seconds)) + ",\n";
+    content += SerializeUnsignedInt("taskbar_monitor_index", config.taskbar_monitor_index) + "\n";
     content += "}\n";
 
     HANDLE file_handle =

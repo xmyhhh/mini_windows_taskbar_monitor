@@ -45,6 +45,8 @@ constexpr UINT kSampleInterval1sCommandId = 1007;
 constexpr UINT kSampleInterval2sCommandId = 1008;
 constexpr UINT kSampleInterval5sCommandId = 1009;
 constexpr UINT kSampleInterval10sCommandId = 1010;
+constexpr UINT kLanguageEnglishCommandId = 1011;
+constexpr UINT kLanguageChineseCommandId = 1012;
 constexpr UINT kMetricCpuCommandId = 1101;
 constexpr UINT kMetricMemoryCommandId = 1102;
 constexpr UINT kMetricUploadCommandId = 1103;
@@ -52,6 +54,8 @@ constexpr UINT kMetricDownloadCommandId = 1104;
 constexpr UINT kMetricGpuCommandId = 1105;
 constexpr UINT kMetricDiskReadCommandId = 1106;
 constexpr UINT kMetricDiskWriteCommandId = 1107;
+constexpr UINT kMonitorCommandBaseId = 1200;
+constexpr UINT kMonitorCommandMaxId = 1299;
 constexpr wchar_t kRunRegistryPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValueName[] = L"MinimalTaskbarMonitor";
 constexpr int kHoverPopupMaxVisibleRows = 14;
@@ -226,16 +230,6 @@ std::wstring FormatRate(unsigned long long bytes_per_second) {
 std::wstring FormatNetworkRate(unsigned long long bytes_per_second,
                                NetworkDisplayUnit network_display_unit) {
     return FormatNetworkRateForDisplay(bytes_per_second, network_display_unit);
-}
-
-const wchar_t* GetNetworkUnitFooterText(NetworkDisplayUnit network_display_unit) {
-    switch (network_display_unit) {
-    case NetworkDisplayUnit::kBytesPerSecond:
-        return L"* VRAM shows dedicated GPU memory. NET is shown in B/s and estimated from IO-other activity.";
-    case NetworkDisplayUnit::kBitsPerSecond:
-    default:
-        return L"* VRAM shows dedicated GPU memory. NET is shown in bit/s and estimated from IO-other activity.";
-    }
 }
 
 std::wstring FormatBytes(unsigned long long byte_count) {
@@ -636,6 +630,7 @@ private:
         if (!EnsureWidgetWindow()) {
             return false;
         }
+        embedder_.SetTargetMonitorIndex(app_config_.taskbar_monitor_index);
         RefreshFontAndSize();
 
         ReattachWidget();
@@ -706,10 +701,24 @@ private:
         notify_icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         notify_icon.uCallbackMessage = kTrayIconCallbackMessage;
         notify_icon.hIcon = tray_icon_handle_;
-        wcscpy_s(notify_icon.szTip, L"Minimal Taskbar Monitor");
+        wcscpy_s(notify_icon.szTip, AppTitle());
 
         tray_icon_added_ = Shell_NotifyIconW(NIM_ADD, &notify_icon) != FALSE;
         return tray_icon_added_;
+    }
+
+    void UpdateTrayIconTip() {
+        if (!tray_icon_added_ || controller_window_ == nullptr || !IsWindow(controller_window_)) {
+            return;
+        }
+
+        NOTIFYICONDATAW notify_icon{};
+        notify_icon.cbSize = sizeof(notify_icon);
+        notify_icon.hWnd = controller_window_;
+        notify_icon.uID = kTrayIconId;
+        notify_icon.uFlags = NIF_TIP;
+        wcscpy_s(notify_icon.szTip, AppTitle());
+        Shell_NotifyIconW(NIM_MODIFY, &notify_icon);
     }
 
     void RemoveTrayIcon() {
@@ -766,18 +775,31 @@ private:
         }
     }
 
-    void ReattachWidget() {
+    void ReattachWidget(bool recreate_widget = false) {
         HideHoverPopup();
+        if (recreate_widget && widget_window_ != nullptr && IsWindow(widget_window_)) {
+            HWND old_widget_window = widget_window_;
+            widget_window_ = nullptr;
+            embedder_.Detach(old_widget_window);
+            DestroyWindow(old_widget_window);
+        }
         if (!EnsureWidgetWindow()) {
             SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
             return;
         }
 
         embedder_.Detach(widget_window_);
+        embedder_.SetTargetMonitorIndex(app_config_.taskbar_monitor_index);
         if (!embedder_.Attach(widget_window_)) {
-            ShowWindow(widget_window_, SW_HIDE);
-            SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
-            return;
+            if (widget_window_ != nullptr && IsWindow(widget_window_)) {
+                DestroyWindow(widget_window_);
+                widget_window_ = nullptr;
+            }
+            if (!EnsureWidgetWindow() || !embedder_.Attach(widget_window_)) {
+                ShowWindow(widget_window_, SW_HIDE);
+                SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
+                return;
+            }
         }
 
         RefreshFontAndSize();
@@ -818,7 +840,9 @@ private:
             font_ != nullptr ? font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         HGDIOBJ old_font = SelectObject(screen_dc, active_font);
         const DisplayLines sample_lines =
-            GetMetricsSampleLines(app_config_.visible_metrics, app_config_.network_display_unit);
+            GetMetricsSampleLines(app_config_.visible_metrics,
+                                  app_config_.network_display_unit,
+                                  IsChinese());
         const int column_gap = ScaleByDpi(current_dpi_, 8);
         column_widths_ = MeasureColumnWidths(screen_dc, sample_lines.columns);
         TEXTMETRICW text_metrics{};
@@ -860,7 +884,10 @@ private:
 
     void UpdateDisplayLines(const MetricsSnapshot& snapshot) {
         const DisplayLines lines = FormatMetricsLines(
-            snapshot, app_config_.visible_metrics, app_config_.network_display_unit);
+            snapshot,
+            app_config_.visible_metrics,
+            app_config_.network_display_unit,
+            IsChinese());
         line1_text_ = lines.line1;
         line2_text_ = lines.line2;
         display_columns_ = lines.columns;
@@ -1106,25 +1133,37 @@ private:
         const int total_count = hover_popup_base_snapshot_.total_process_count;
         const std::wstring count_suffix =
             hover_popup_search_text_.empty()
-                ? (total_count > 0 ? L"  (" + std::to_wstring(total_count) + L" shown)" : L"")
+                ? (total_count > 0
+                       ? L"  (" + std::to_wstring(total_count) +
+                             std::wstring(Text(L" shown)", L" 个)"))
+                       : L"")
                 : (L"  (" + std::to_wstring(visible_count) + L"/" +
                    std::to_wstring(std::max(total_count, 0)) + L")");
         switch (hover_popup_sort_mode_) {
         case HoverPopupSortMode::kCpu:
-            return std::wstring(L"Processes sorted by CPU") + count_suffix;
+            return std::wstring(Text(L"Processes sorted by CPU", L"按 CPU 排序的进程")) +
+                   count_suffix;
         case HoverPopupSortMode::kMemory:
-            return std::wstring(L"Processes sorted by memory (USS -> RSS -> VMS)") + count_suffix;
+            return std::wstring(Text(L"Processes sorted by memory (USS -> RSS -> VMS)",
+                                     L"按内存排序的进程 (USS -> RSS -> VMS)")) +
+                   count_suffix;
         case HoverPopupSortMode::kGpu:
-            return std::wstring(L"Processes sorted by GPU") + count_suffix;
+            return std::wstring(Text(L"Processes sorted by GPU", L"按 GPU 排序的进程")) +
+                   count_suffix;
         case HoverPopupSortMode::kVram:
-            return std::wstring(L"Processes sorted by VRAM") + count_suffix;
+            return std::wstring(Text(L"Processes sorted by VRAM", L"按 VRAM 排序的进程")) +
+                   count_suffix;
         case HoverPopupSortMode::kIo:
-            return std::wstring(L"Processes sorted by IO") + count_suffix;
+            return std::wstring(Text(L"Processes sorted by IO", L"按 IO 排序的进程")) +
+                   count_suffix;
         case HoverPopupSortMode::kNetwork:
-            return std::wstring(L"Processes sorted by network") + count_suffix;
+            return std::wstring(Text(L"Processes sorted by network", L"按网络排序的进程")) +
+                   count_suffix;
         case HoverPopupSortMode::kDefault:
         default:
-            return std::wstring(L"Processes by blended pressure score") + count_suffix;
+            return std::wstring(Text(L"Processes by blended pressure score",
+                                     L"按综合压力评分排序的进程")) +
+                   count_suffix;
         }
     }
 
@@ -1519,7 +1558,7 @@ private:
                         client_rect.top + padding_left + popup_title_line_height_};
         SetTextColor(dc, palette.title_text);
         DrawTextW(dc,
-                  L"Performance Snapshot",
+                  Text(L"Performance Snapshot", L"性能快照"),
                   -1,
                   &title_rect,
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -1586,22 +1625,25 @@ private:
                             ResolveAlertColor(palette,
                                               GetUsageAlertLevel(last_snapshot_.gpu_percent, 90.0, 98.0),
                                               palette.primary_text));
-        draw_inline_segment(summary_line1_rect, L"   PROC ", palette.primary_text);
+        draw_inline_segment(summary_line1_rect, Text(L"   PROC ", L"   进程 "), palette.primary_text);
         draw_inline_segment(summary_line1_rect, proc_summary, palette.secondary_text);
 
         const std::wstring summary_line2 =
-            L"NET \u2191 " +
+            std::wstring(Text(L"NET \u2191 ", L"网络 \u2191 ")) +
             FormatNetworkRate(last_snapshot_.upload_bytes_per_second,
                               app_config_.network_display_unit) +
             L"   \u2193 " +
             FormatNetworkRate(last_snapshot_.download_bytes_per_second,
                               app_config_.network_display_unit) +
-            L"   DISK R " +
-            FormatRate(last_snapshot_.disk_read_bytes_per_second) + L"   W " +
+            std::wstring(Text(L"   DISK R ", L"   磁盘读 ")) +
+            FormatRate(last_snapshot_.disk_read_bytes_per_second) +
+            std::wstring(Text(L"   W ", L"   磁盘写 ")) +
             FormatRate(last_snapshot_.disk_write_bytes_per_second);
         const std::wstring summary_line3 =
-            L"Uptime " + FormatUptime(hover_popup_snapshot_.uptime_ms) +
-            L"   MEM = RSS / USS / VMS(commit)   VRAM = dedicated GPU memory";
+            std::wstring(Text(L"Uptime ", L"运行时间 ")) +
+            FormatUptime(hover_popup_snapshot_.uptime_ms) +
+            Text(L"   MEM = RSS / USS / VMS(commit)   VRAM = dedicated GPU memory",
+                 L"   内存 = RSS / USS / VMS(commit)   VRAM = 专用 GPU 内存");
 
         OffsetRect(&line_rect, 0, popup_text_line_height_ + line_gap);
         SetTextColor(dc, palette.primary_text);
@@ -1641,7 +1683,8 @@ private:
         } else if (hover_popup_search_active_) {
             search_text = L"|";
         } else {
-            search_text = L"Search processes...  (type to filter)";
+            search_text = Text(L"Search processes...  (type to filter)",
+                               L"搜索进程...  (输入以过滤)");
             search_text_color = palette.search_placeholder;
         }
         SetTextColor(dc, search_text_color);
@@ -1673,7 +1716,7 @@ private:
         };
 
         draw_header(L"#", table_layout.rank_rect, DT_LEFT);
-        draw_header(L"Process", table_layout.name_rect, DT_LEFT);
+        draw_header(Text(L"Process", L"进程"), table_layout.name_rect, DT_LEFT);
         draw_header(GetHoverPopupHeaderText(L"CPU", HoverPopupSortMode::kCpu),
                     table_layout.cpu_rect,
                     DT_RIGHT,
@@ -1717,8 +1760,10 @@ private:
             SetTextColor(dc, palette.secondary_text);
             DrawTextW(dc,
                       hover_popup_base_snapshot_.total_process_count > 0
-                          ? L"No matching processes. Press Esc to clear search."
-                          : L"Process data is warming up. Keep the popup open for a second.",
+                          ? Text(L"No matching processes. Press Esc to clear search.",
+                                 L"没有匹配的进程。按 Esc 清除搜索。")
+                          : Text(L"Process data is warming up. Keep the popup open for a second.",
+                                 L"进程数据正在预热，请保持弹窗打开一会儿。"),
                       -1,
                       &empty_rect,
                       DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -1861,12 +1906,13 @@ private:
                           footer_rect1.bottom + line_gap + popup_text_line_height_};
         SetTextColor(dc, palette.secondary_text);
         DrawTextW(dc,
-                  L"* MEM shows RSS / USS / VMS(commit, psutil/taskmgr-style). PSS is not exposed directly yet.",
+                  Text(L"* MEM shows RSS / USS / VMS(commit, psutil/taskmgr-style). PSS is not exposed directly yet.",
+                       L"* MEM 显示 RSS / USS / VMS(commit，类似 psutil/任务管理器)。暂不直接显示 PSS。"),
                   -1,
                   &footer_rect1,
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
         DrawTextW(dc,
-                  GetNetworkUnitFooterText(app_config_.network_display_unit),
+                  GetNetworkUnitFooterText(),
                   -1,
                   &footer_rect2,
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -2124,6 +2170,67 @@ private:
         return SaveAppConfig(app_config_);
     }
 
+    bool IsChinese() const {
+        return app_config_.language == UiLanguage::kChinese;
+    }
+
+    const wchar_t* Text(const wchar_t* english, const wchar_t* chinese) const {
+        return IsChinese() ? chinese : english;
+    }
+
+    const wchar_t* AppTitle() const {
+        return Text(L"Minimal Taskbar Monitor", L"任务栏监视器");
+    }
+
+    const wchar_t* ConfigSaveErrorText() const {
+        return Text(L"Unable to save the local config file.", L"无法保存本地配置文件。");
+    }
+
+    const wchar_t* GetNetworkUnitFooterText() const {
+        switch (app_config_.network_display_unit) {
+        case NetworkDisplayUnit::kBytesPerSecond:
+            return Text(
+                L"* VRAM shows dedicated GPU memory. NET is shown in B/s and estimated from IO-other activity.",
+                L"* VRAM 显示专用 GPU 内存。NET 以 B/s 显示，并基于 IO-other 活动估算。");
+        case NetworkDisplayUnit::kBitsPerSecond:
+        default:
+            return Text(
+                L"* VRAM shows dedicated GPU memory. NET is shown in bit/s and estimated from IO-other activity.",
+                L"* VRAM 显示专用 GPU 内存。NET 以 bit/s 显示，并基于 IO-other 活动估算。");
+        }
+    }
+
+    bool SetLanguage(UiLanguage language) {
+        if (app_config_.language == language) {
+            return true;
+        }
+        const UiLanguage previous_language = app_config_.language;
+        app_config_.language = language;
+        if (!SaveConfig()) {
+            app_config_.language = previous_language;
+            MessageBoxW(controller_window_,
+                        ConfigSaveErrorText(),
+                        AppTitle(),
+                        MB_OK | MB_ICONERROR);
+            return false;
+        }
+        UpdateDisplayLines(last_snapshot_);
+        RefreshFontAndSize();
+        if (embedder_.IsAttached()) {
+            if (!embedder_.RefreshLayout(widget_window_, widget_size_)) {
+                ShowWindow(widget_window_, SW_HIDE);
+                SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
+            }
+        }
+        UpdateTrayIconTip();
+        RequestWidgetRedraw();
+        if (hover_popup_visible_) {
+            PositionHoverPopup();
+            RequestHoverPopupRedraw();
+        }
+        return true;
+    }
+
     void ApplyMetricVisibilityChange() {
         UpdateDisplayLines(last_snapshot_);
         RefreshFontAndSize();
@@ -2172,8 +2279,8 @@ private:
 
         if (*target && CountVisibleMetrics(app_config_.visible_metrics) <= 1) {
             MessageBoxW(controller_window_,
-                        L"Keep at least one metric visible.",
-                        L"Minimal Taskbar Monitor",
+                        Text(L"Keep at least one metric visible.", L"请至少保留一个可见指标。"),
+                        AppTitle(),
                         MB_OK | MB_ICONINFORMATION);
             return true;
         }
@@ -2182,8 +2289,8 @@ private:
         if (!SaveConfig()) {
             *target = !*target;
             MessageBoxW(controller_window_,
-                        L"Unable to save the local config file.",
-                        L"Minimal Taskbar Monitor",
+                        ConfigSaveErrorText(),
+                        AppTitle(),
                         MB_OK | MB_ICONERROR);
             return true;
         }
@@ -2202,8 +2309,8 @@ private:
         if (!SaveConfig()) {
             app_config_.network_display_unit = previous_unit;
             MessageBoxW(controller_window_,
-                        L"Unable to save the local config file.",
-                        L"Minimal Taskbar Monitor",
+                        ConfigSaveErrorText(),
+                        AppTitle(),
                         MB_OK | MB_ICONERROR);
             return true;
         }
@@ -2222,8 +2329,8 @@ private:
         if (!SaveConfig()) {
             app_config_.popup_activation_mode = previous_mode;
             MessageBoxW(controller_window_,
-                        L"Unable to save the local config file.",
-                        L"Minimal Taskbar Monitor",
+                        ConfigSaveErrorText(),
+                        AppTitle(),
                         MB_OK | MB_ICONERROR);
             return true;
         }
@@ -2245,8 +2352,8 @@ private:
         if (!SaveConfig()) {
             app_config_.sample_interval_seconds = previous_interval;
             MessageBoxW(controller_window_,
-                        L"Unable to save the local config file.",
-                        L"Minimal Taskbar Monitor",
+                        ConfigSaveErrorText(),
+                        AppTitle(),
                         MB_OK | MB_ICONERROR);
             return true;
         }
@@ -2256,6 +2363,51 @@ private:
                  GetSampleTimerIntervalMs(app_config_.sample_interval_seconds),
                  nullptr);
         SampleAndRefresh();
+        return true;
+    }
+
+    bool SetTaskbarMonitorIndex(unsigned int monitor_index) {
+        const std::vector<TaskbarDisplayInfo> displays = TaskbarEmbedder::EnumerateDisplays();
+        const auto display = std::find_if(displays.begin(),
+                                          displays.end(),
+                                          [monitor_index](const TaskbarDisplayInfo& item) {
+                                              return item.index == monitor_index;
+                                          });
+        if (display == displays.end() || !display->has_taskbar) {
+            MessageBoxW(controller_window_,
+                        Text(L"The selected display does not have an available taskbar.",
+                             L"所选显示器没有可用任务栏。"),
+                        AppTitle(),
+                        MB_OK | MB_ICONINFORMATION);
+            return true;
+        }
+
+        if (app_config_.taskbar_monitor_index == monitor_index) {
+            return true;
+        }
+
+        const unsigned int previous_index = app_config_.taskbar_monitor_index;
+        app_config_.taskbar_monitor_index = monitor_index;
+        if (!SaveConfig()) {
+            app_config_.taskbar_monitor_index = previous_index;
+            MessageBoxW(controller_window_,
+                        ConfigSaveErrorText(),
+                        AppTitle(),
+                        MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        ReattachWidget(true);
+        if (!embedder_.IsAttached()) {
+            app_config_.taskbar_monitor_index = previous_index;
+            SaveConfig();
+            ReattachWidget(true);
+            MessageBoxW(controller_window_,
+                        Text(L"Unable to move the widget to the selected display.",
+                             L"无法将窗口移动到所选显示器。"),
+                        AppTitle(),
+                        MB_OK | MB_ICONWARNING);
+        }
         return true;
     }
 
@@ -2328,8 +2480,8 @@ private:
         const bool enabled = IsAutoStartEnabled();
         if (!SetAutoStartEnabled(!enabled)) {
             MessageBoxW(controller_window_,
-                        L"Unable to update the startup setting.",
-                        L"Minimal Taskbar Monitor",
+                        Text(L"Unable to update the startup setting.", L"无法更新开机启动设置。"),
+                        AppTitle(),
                         MB_OK | MB_ICONERROR);
         }
     }
@@ -2341,110 +2493,161 @@ private:
         HMENU network_units_menu = CreatePopupMenu();
         HMENU popup_mode_menu = CreatePopupMenu();
         HMENU refresh_interval_menu = CreatePopupMenu();
+        HMENU monitor_menu = CreatePopupMenu();
+        HMENU language_menu = CreatePopupMenu();
         AppendMenuW(metrics_menu,
                     MF_STRING | (app_config_.visible_metrics.show_cpu ? MF_CHECKED : MF_UNCHECKED),
                     kMetricCpuCommandId,
-                    L"CPU Usage");
+                    Text(L"CPU Usage", L"CPU 占用"));
         AppendMenuW(metrics_menu,
                     MF_STRING |
                         (app_config_.visible_metrics.show_memory ? MF_CHECKED : MF_UNCHECKED),
                     kMetricMemoryCommandId,
-                    L"Memory");
+                    Text(L"Memory", L"内存"));
         AppendMenuW(metrics_menu,
                     MF_STRING |
                         (app_config_.visible_metrics.show_upload ? MF_CHECKED : MF_UNCHECKED),
                     kMetricUploadCommandId,
-                    L"Upload Speed");
+                    Text(L"Upload Speed", L"上传速度"));
         AppendMenuW(metrics_menu,
                     MF_STRING |
                         (app_config_.visible_metrics.show_download ? MF_CHECKED : MF_UNCHECKED),
                     kMetricDownloadCommandId,
-                    L"Download Speed");
+                    Text(L"Download Speed", L"下载速度"));
         AppendMenuW(metrics_menu,
                     MF_STRING | (app_config_.visible_metrics.show_gpu ? MF_CHECKED : MF_UNCHECKED),
                     kMetricGpuCommandId,
-                    L"GPU Usage");
+                    Text(L"GPU Usage", L"GPU 占用"));
         AppendMenuW(metrics_menu,
                     MF_STRING |
                         (app_config_.visible_metrics.show_disk_read ? MF_CHECKED : MF_UNCHECKED),
                     kMetricDiskReadCommandId,
-                    L"Disk Read");
+                    Text(L"Disk Read", L"磁盘读取"));
         AppendMenuW(metrics_menu,
                     MF_STRING |
                         (app_config_.visible_metrics.show_disk_write ? MF_CHECKED : MF_UNCHECKED),
                     kMetricDiskWriteCommandId,
-                    L"Disk Write");
+                    Text(L"Disk Write", L"磁盘写入"));
         AppendMenuW(network_units_menu,
                     MF_STRING |
                         (app_config_.network_display_unit == NetworkDisplayUnit::kBitsPerSecond
                              ? MF_CHECKED
                              : MF_UNCHECKED),
                     kNetworkUnitsBitsCommandId,
-                    L"Bits/sec (Task Manager style)");
+                    Text(L"Bits/sec (Task Manager style)", L"位/秒（任务管理器风格）"));
         AppendMenuW(network_units_menu,
                     MF_STRING |
                         (app_config_.network_display_unit == NetworkDisplayUnit::kBytesPerSecond
                              ? MF_CHECKED
                              : MF_UNCHECKED),
                     kNetworkUnitsBytesCommandId,
-                    L"Bytes/sec (KB/s, MB/s)");
+                    Text(L"Bytes/sec (KB/s, MB/s)", L"字节/秒（KB/s, MB/s）"));
         AppendMenuW(popup_mode_menu,
                     MF_STRING |
                         (app_config_.popup_activation_mode == PopupActivationMode::kHover
                              ? MF_CHECKED
                              : MF_UNCHECKED),
                     kPopupModeHoverCommandId,
-                    L"Hover popup");
+                    Text(L"Hover popup", L"悬停弹窗"));
         AppendMenuW(popup_mode_menu,
                     MF_STRING |
                         (app_config_.popup_activation_mode == PopupActivationMode::kClick
                              ? MF_CHECKED
                              : MF_UNCHECKED),
                     kPopupModeClickCommandId,
-                    L"Click popup");
+                    Text(L"Click popup", L"点击弹窗"));
         AppendMenuW(refresh_interval_menu,
                     MF_STRING |
                         (app_config_.sample_interval_seconds == 1 ? MF_CHECKED : MF_UNCHECKED),
                     kSampleInterval1sCommandId,
-                    L"1 second");
+                    Text(L"1 second", L"1 秒"));
         AppendMenuW(refresh_interval_menu,
                     MF_STRING |
                         (app_config_.sample_interval_seconds == 2 ? MF_CHECKED : MF_UNCHECKED),
                     kSampleInterval2sCommandId,
-                    L"2 seconds");
+                    Text(L"2 seconds", L"2 秒"));
         AppendMenuW(refresh_interval_menu,
                     MF_STRING |
                         (app_config_.sample_interval_seconds == 5 ? MF_CHECKED : MF_UNCHECKED),
                     kSampleInterval5sCommandId,
-                    L"5 seconds");
+                    Text(L"5 seconds", L"5 秒"));
         AppendMenuW(refresh_interval_menu,
                     MF_STRING |
                         (app_config_.sample_interval_seconds == 10 ? MF_CHECKED : MF_UNCHECKED),
                     kSampleInterval10sCommandId,
-                    L"10 seconds");
+                    Text(L"10 seconds", L"10 秒"));
+
+        const std::vector<TaskbarDisplayInfo> displays = TaskbarEmbedder::EnumerateDisplays();
+        for (size_t i = 0; i < displays.size() && i < 100; ++i) {
+            const TaskbarDisplayInfo& display = displays[i];
+            std::wstring label =
+                Text(L"Monitor ", L"显示器 ") + std::to_wstring(display.index + 1);
+            if (display.primary) {
+                label += Text(L" (Primary)", L"（主屏）");
+            }
+            if (!display.has_taskbar) {
+                label += Text(L" (No taskbar)", L"（无任务栏）");
+            }
+            const UINT flags = MF_STRING |
+                               (display.has_taskbar ? MF_ENABLED : MF_GRAYED) |
+                               (app_config_.taskbar_monitor_index == display.index ? MF_CHECKED
+                                                                                   : MF_UNCHECKED);
+            AppendMenuW(monitor_menu,
+                        flags,
+                        kMonitorCommandBaseId + static_cast<UINT>(display.index),
+                        label.c_str());
+        }
+        if (displays.empty()) {
+            AppendMenuW(monitor_menu,
+                        MF_STRING | MF_GRAYED,
+                        kMonitorCommandBaseId,
+                        Text(L"No display detected", L"未检测到显示器"));
+        }
+
+        AppendMenuW(language_menu,
+                    MF_STRING |
+                        (app_config_.language == UiLanguage::kEnglish ? MF_CHECKED : MF_UNCHECKED),
+                    kLanguageEnglishCommandId,
+                    L"English");
+        AppendMenuW(language_menu,
+                    MF_STRING |
+                        (app_config_.language == UiLanguage::kChinese ? MF_CHECKED : MF_UNCHECKED),
+                    kLanguageChineseCommandId,
+                    L"中文");
 
         AppendMenuW(menu,
                     MF_POPUP,
                     reinterpret_cast<UINT_PTR>(metrics_menu),
-                    L"Visible Metrics");
+                    Text(L"Visible Metrics", L"显示指标"));
         AppendMenuW(menu,
                     MF_POPUP,
                     reinterpret_cast<UINT_PTR>(network_units_menu),
-                    L"Network Units");
+                    Text(L"Network Units", L"网络单位"));
         AppendMenuW(menu,
                     MF_POPUP,
                     reinterpret_cast<UINT_PTR>(popup_mode_menu),
-                    L"Popup Mode");
+                    Text(L"Popup Mode", L"弹窗模式"));
         AppendMenuW(menu,
                     MF_POPUP,
                     reinterpret_cast<UINT_PTR>(refresh_interval_menu),
-                    L"Refresh Interval");
+                    Text(L"Refresh Interval", L"刷新间隔"));
+        AppendMenuW(menu,
+                    MF_POPUP,
+                    reinterpret_cast<UINT_PTR>(monitor_menu),
+                    Text(L"Display", L"显示器"));
+        AppendMenuW(menu,
+                    MF_POPUP,
+                    reinterpret_cast<UINT_PTR>(language_menu),
+                    Text(L"Language", L"语言"));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         const UINT auto_start_flags =
             MF_STRING | (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED);
-        AppendMenuW(menu, auto_start_flags, kAutoStartCommandId, L"Launch at startup");
+        AppendMenuW(menu,
+                    auto_start_flags,
+                    kAutoStartCommandId,
+                    Text(L"Launch at startup", L"开机启动"));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, kExitCommandId, L"Exit");
+        AppendMenuW(menu, MF_STRING, kExitCommandId, Text(L"Exit", L"退出"));
 
         SetForegroundWindow(controller_window_ != nullptr ? controller_window_ : widget_window_);
         const UINT command =
@@ -2486,6 +2689,18 @@ private:
         }
         if (command == kSampleInterval10sCommandId) {
             SetSampleIntervalSeconds(10);
+            return;
+        }
+        if (command >= kMonitorCommandBaseId && command <= kMonitorCommandMaxId) {
+            SetTaskbarMonitorIndex(command - kMonitorCommandBaseId);
+            return;
+        }
+        if (command == kLanguageEnglishCommandId) {
+            SetLanguage(UiLanguage::kEnglish);
+            return;
+        }
+        if (command == kLanguageChineseCommandId) {
+            SetLanguage(UiLanguage::kChinese);
             return;
         }
         if (command == kAutoStartCommandId) {

@@ -177,7 +177,7 @@ std::wstring JoinSegments(const std::vector<std::wstring>& segments) {
     return result;
 }
 
-void NormalizeDisplayLines(DisplayLines& lines) {
+void NormalizeDisplayLines(DisplayLines& lines, bool) {
     NormalizeDisplayColumns(lines);
     lines.line1 = JoinColumnTexts(lines.columns, true);
     lines.line2 = JoinColumnTexts(lines.columns, false);
@@ -188,7 +188,7 @@ void NormalizeDisplayLines(DisplayLines& lines) {
     }
     if (lines.line1.empty()) {
         lines.line1 = L"No metrics";
-        lines.columns = {{L"No metrics", L""}};
+        lines.columns = {{lines.line1, L""}};
     }
 }
 
@@ -552,7 +552,8 @@ bool SystemMetrics::QueryNetworkInterfaces(NetworkInterfaceCounters& interfaces)
 
 DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
                                 const MetricVisibility& visibility,
-                                NetworkDisplayUnit network_display_unit) {
+                                NetworkDisplayUnit network_display_unit,
+                                bool use_chinese_labels) {
     DisplayLines lines{};
     AddOptionalPairColumn(lines.columns,
                           visibility.show_cpu,
@@ -578,7 +579,7 @@ DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
                                                           network_display_unit),
                           visibility.show_download,
                           std::wstring(L"\u2193 ") +
-                              FormatNetworkRateForDisplay(snapshot.download_bytes_per_second,
+                          FormatNetworkRateForDisplay(snapshot.download_bytes_per_second,
                                                           network_display_unit));
     AddOptionalPairColumn(lines.columns,
                           visibility.show_disk_read,
@@ -588,15 +589,20 @@ DisplayLines FormatMetricsLines(const MetricsSnapshot& snapshot,
                           std::wstring(L"W ") +
                               FormatByteRate(snapshot.disk_write_bytes_per_second));
 
-    NormalizeDisplayLines(lines);
+    NormalizeDisplayLines(lines, use_chinese_labels);
     return lines;
 }
 
 DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility,
-                                   NetworkDisplayUnit network_display_unit) {
+                                   NetworkDisplayUnit network_display_unit,
+                                   bool use_chinese_labels) {
     DisplayLines lines{};
     AddOptionalPairColumn(
-        lines.columns, visibility.show_cpu, L"CPU 100%", visibility.show_memory, L"MEM 100%");
+        lines.columns,
+        visibility.show_cpu,
+        L"CPU 100%",
+        visibility.show_memory,
+        L"MEM 100%");
     if (visibility.show_gpu) {
         AddColumn(lines.columns, L"GPU 100%");
     }
@@ -615,7 +621,7 @@ DisplayLines GetMetricsSampleLines(const MetricVisibility& visibility,
                           visibility.show_disk_write,
                           L"W 99.9GB/s");
 
-    NormalizeDisplayLines(lines);
+    NormalizeDisplayLines(lines, use_chinese_labels);
     return lines;
 }
 
